@@ -5,7 +5,11 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +21,15 @@ import (
 
 var statisticsEnabled atomic.Bool
 
+const (
+	usageLogDir      = "/var/log/cliproxy"
+	usageLogFileName = "usage.jsonl"
+)
+
+var usageLogSink usageLogWriter = &fileUsageLogWriter{
+	path: filepath.Join(usageLogDir, usageLogFileName),
+}
+
 func init() {
 	statisticsEnabled.Store(true)
 	coreusage.RegisterPlugin(NewLoggerPlugin())
@@ -26,6 +39,47 @@ func init() {
 // It implements coreusage.Plugin to receive usage records emitted by the runtime.
 type LoggerPlugin struct {
 	stats *RequestStatistics
+}
+
+type usageLogEntry struct {
+	TimestampText string `json:"TimestampText"`
+	IP            string `json:"IP"`
+	URI           string `json:"URI"`
+	Tokens        int64  `json:"Tokens"`
+	CostTime      int64  `json:"CostTime"`
+	Timestamp     int64  `json:"Timestamp"`
+}
+
+type usageLogWriter interface {
+	WriteLine([]byte) error
+}
+
+type fileUsageLogWriter struct {
+	mu   sync.Mutex
+	path string
+}
+
+func (w *fileUsageLogWriter) WriteLine(payload []byte) error {
+	if w == nil || strings.TrimSpace(w.path) == "" {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	dir := filepath.Dir(w.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("usage: create log dir: %w", err)
+	}
+	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("usage: open log file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.Write(append(payload, '\n')); err != nil {
+		return fmt.Errorf("usage: write log file: %w", err)
+	}
+	return nil
 }
 
 // NewLoggerPlugin constructs a new logger plugin instance.
@@ -41,13 +95,26 @@ func NewLoggerPlugin() *LoggerPlugin { return &LoggerPlugin{stats: defaultReques
 //   - ctx: The context for the usage record
 //   - record: The usage record to aggregate
 func (p *LoggerPlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
-	if !statisticsEnabled.Load() {
+	if p != nil && p.stats != nil && statisticsEnabled.Load() {
+		p.stats.Record(ctx, record)
+	}
+	if p == nil {
 		return
 	}
-	if p == nil || p.stats == nil {
+	p.logUsage(ctx, record)
+}
+
+func (p *LoggerPlugin) logUsage(ctx context.Context, record coreusage.Record) {
+	payload, err := buildUsageLogPayload(ctx, record)
+	if err != nil {
 		return
 	}
-	p.stats.Record(ctx, record)
+	if usageLogSink == nil {
+		return
+	}
+	if err := usageLogSink.WriteLine(payload); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
 }
 
 // SetStatisticsEnabled toggles whether in-memory statistics are recorded.
@@ -481,4 +548,68 @@ func formatHour(hour int) string {
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+func buildUsageLogPayload(ctx context.Context, record coreusage.Record) ([]byte, error) {
+	detail := normaliseDetail(record.Detail)
+	timestamp := resolveUsageLogTimestamp(record)
+	entry := usageLogEntry{
+		TimestampText: timestamp.Format(time.RFC3339),
+		IP:            resolveClientIP(ctx),
+		URI:           resolveRequestURI(ctx),
+		Tokens:        detail.TotalTokens,
+		CostTime:      normaliseLatency(record.Latency),
+		Timestamp:     timestamp.Unix(),
+	}
+	return json.Marshal(entry)
+}
+
+func resolveUsageLogTimestamp(record coreusage.Record) time.Time {
+	if !record.RequestedAt.IsZero() {
+		return record.RequestedAt
+	}
+	now := time.Now()
+	if record.Latency > 0 {
+		return now.Add(-record.Latency)
+	}
+	return now
+}
+
+func resolveClientIP(ctx context.Context) string {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx == nil {
+		return ""
+	}
+	if ip := strings.TrimSpace(ginCtx.ClientIP()); ip != "" {
+		return ip
+	}
+	if ginCtx.Request == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(ginCtx.Request.RemoteAddr))
+	if err == nil {
+		return host
+	}
+	return strings.TrimSpace(ginCtx.Request.RemoteAddr)
+}
+
+func resolveRequestURI(ctx context.Context) string {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx == nil {
+		return ""
+	}
+	if ginCtx.Request != nil && ginCtx.Request.URL != nil {
+		if path := strings.TrimSpace(ginCtx.Request.URL.Path); path != "" {
+			return path
+		}
+	}
+	return strings.TrimSpace(ginCtx.FullPath())
+}
+
+func resolveGinContext(ctx context.Context) *gin.Context {
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, _ := ctx.Value("gin").(*gin.Context)
+	return ginCtx
 }
