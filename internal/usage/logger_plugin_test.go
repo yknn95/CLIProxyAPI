@@ -113,7 +113,11 @@ func TestBuildUsageLogPayloadIncludesRequestMetadata(t *testing.T) {
 	payload, err := buildUsageLogPayload(context.WithValue(context.Background(), "gin", ctx), coreusage.Record{
 		Latency: 12 * time.Millisecond,
 		Detail: coreusage.Detail{
-			TotalTokens: 12348,
+			InputTokens:     123,
+			OutputTokens:    456,
+			ReasoningTokens: 78,
+			CachedTokens:    9,
+			TotalTokens:     12348,
 		},
 	})
 	if err != nil {
@@ -136,6 +140,18 @@ func TestBuildUsageLogPayloadIncludesRequestMetadata(t *testing.T) {
 	if got.TimestampText == "" {
 		t.Fatal("TimestampText = empty, want non-empty")
 	}
+	if got.InputTokens != 123 {
+		t.Fatalf("InputTokens = %d, want %d", got.InputTokens, 123)
+	}
+	if got.OutputTokens != 456 {
+		t.Fatalf("OutputTokens = %d, want %d", got.OutputTokens, 456)
+	}
+	if got.ReasoningTokens != 78 {
+		t.Fatalf("ReasoningTokens = %d, want %d", got.ReasoningTokens, 78)
+	}
+	if got.CachedTokens != 9 {
+		t.Fatalf("CachedTokens = %d, want %d", got.CachedTokens, 9)
+	}
 	if got.Tokens != 12348 {
 		t.Fatalf("Tokens = %d, want %d", got.Tokens, 12348)
 	}
@@ -154,20 +170,36 @@ func TestLoggerPluginHandleUsageWritesDedicatedUsageLog(t *testing.T) {
 	plugin.HandleUsage(context.Background(), coreusage.Record{
 		Latency: 8 * time.Millisecond,
 		Detail: coreusage.Detail{
-			TotalTokens: 42,
+			InputTokens:     11,
+			OutputTokens:    22,
+			ReasoningTokens: 3,
+			CachedTokens:    4,
+			TotalTokens:     42,
 		},
 	})
 
 	if len(sink.lines) != 1 {
 		t.Fatalf("logged lines = %d, want 1", len(sink.lines))
 	}
-	if !bytes.Contains(sink.lines[0], []byte('{')) {
+	if !bytes.Contains(sink.lines[0], []byte("{")) {
 		t.Fatalf("log output = %q, want JSON payload", string(sink.lines[0]))
 	}
-	if !bytes.Contains(sink.lines[0], []byte('"Tokens":42')) {
-		t.Fatalf("log output = %q, want token count", string(sink.lines[0]))
+	if !bytes.Contains(sink.lines[0], []byte(`"InputTokens":11`)) {
+		t.Fatalf("log output = %q, want input token count", string(sink.lines[0]))
 	}
-	if !bytes.Contains(sink.lines[0], []byte('"CostTime":8')) {
+	if !bytes.Contains(sink.lines[0], []byte(`"OutputTokens":22`)) {
+		t.Fatalf("log output = %q, want output token count", string(sink.lines[0]))
+	}
+	if !bytes.Contains(sink.lines[0], []byte(`"ReasoningTokens":3`)) {
+		t.Fatalf("log output = %q, want reasoning token count", string(sink.lines[0]))
+	}
+	if !bytes.Contains(sink.lines[0], []byte(`"CachedTokens":4`)) {
+		t.Fatalf("log output = %q, want cached token count", string(sink.lines[0]))
+	}
+	if !bytes.Contains(sink.lines[0], []byte(`"Tokens":42`)) {
+		t.Fatalf("log output = %q, want total token count", string(sink.lines[0]))
+	}
+	if !bytes.Contains(sink.lines[0], []byte(`"CostTime":8`)) {
 		t.Fatalf("log output = %q, want latency", string(sink.lines[0]))
 	}
 }
@@ -224,7 +256,6 @@ func TestBuildUsageLogPayloadFallsBackToCurrentTimeWhenRequestedAtMissing(t *tes
 		t.Fatalf("CostTime = %d, want %d", got.CostTime, 6325)
 	}
 }
-
 
 type memoryUsageLogWriter struct {
 	lines [][]byte

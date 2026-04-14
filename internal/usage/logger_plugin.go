@@ -42,12 +42,16 @@ type LoggerPlugin struct {
 }
 
 type usageLogEntry struct {
-	TimestampText string `json:"TimestampText"`
-	IP            string `json:"IP"`
-	URI           string `json:"URI"`
-	Tokens        int64  `json:"Tokens"`
-	CostTime      int64  `json:"CostTime"`
-	Timestamp     int64  `json:"Timestamp"`
+	TimestampText   string `json:"TimestampText"`
+	IP              string `json:"IP"`
+	URI             string `json:"URI"`
+	InputTokens     int64  `json:"InputTokens"`
+	OutputTokens    int64  `json:"OutputTokens"`
+	ReasoningTokens int64  `json:"ReasoningTokens"`
+	CachedTokens    int64  `json:"CachedTokens"`
+	Tokens          int64  `json:"Tokens"`
+	CostTime        int64  `json:"CostTime"`
+	Timestamp       int64  `json:"Timestamp"`
 }
 
 type usageLogWriter interface {
@@ -554,12 +558,16 @@ func buildUsageLogPayload(ctx context.Context, record coreusage.Record) ([]byte,
 	detail := normaliseDetail(record.Detail)
 	timestamp := resolveUsageLogTimestamp(record)
 	entry := usageLogEntry{
-		TimestampText: timestamp.Format(time.RFC3339),
-		IP:            resolveClientIP(ctx),
-		URI:           resolveRequestURI(ctx),
-		Tokens:        detail.TotalTokens,
-		CostTime:      normaliseLatency(record.Latency),
-		Timestamp:     timestamp.Unix(),
+		TimestampText:   timestamp.Format(time.RFC3339),
+		IP:              resolveClientIP(ctx),
+		URI:             resolveRequestURI(ctx),
+		InputTokens:     detail.InputTokens,
+		OutputTokens:    detail.OutputTokens,
+		ReasoningTokens: detail.ReasoningTokens,
+		CachedTokens:    detail.CachedTokens,
+		Tokens:          detail.TotalTokens,
+		CostTime:        normaliseLatency(record.Latency),
+		Timestamp:       timestamp.Unix(),
 	}
 	return json.Marshal(entry)
 }
