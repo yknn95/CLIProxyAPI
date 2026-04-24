@@ -798,6 +798,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				if eventType == wsEventTypeCompleted {
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					saveImagesFromResponsesPayload(payloads[i])
 				}
 				markAPIResponseTimestamp(c)
 				// log.Infof(

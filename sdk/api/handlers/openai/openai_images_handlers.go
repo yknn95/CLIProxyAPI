@@ -9,6 +9,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +28,8 @@ const (
 	defaultImagesToolModel = "gpt-image-2"
 )
 
+var imagesSaveDir = "/tmp/images"
+
 type imageCallResult struct {
 	Result        string
 	RevisedPrompt string
@@ -33,6 +37,12 @@ type imageCallResult struct {
 	Size          string
 	Background    string
 	Quality       string
+	CallID        string
+}
+
+type imageSaveMetadata struct {
+	CreatedAt int64
+	UsageRaw  []byte
 }
 
 type sseFrameAccumulator struct {
@@ -170,6 +180,83 @@ func parseBoolField(raw string, fallback bool) bool {
 		return false
 	default:
 		return fallback
+	}
+}
+
+func imageFileExt(outputFormat string) string {
+	switch strings.ToLower(strings.TrimSpace(outputFormat)) {
+	case "jpg", "jpeg", "image/jpeg":
+		return ".jpg"
+	case "webp", "image/webp":
+		return ".webp"
+	default:
+		return ".png"
+	}
+}
+
+func saveGeneratedImage(result imageCallResult, index int, metadata imageSaveMetadata) {
+	if strings.TrimSpace(result.Result) == "" {
+		return
+	}
+
+	if err := os.MkdirAll(imagesSaveDir, 0o755); err != nil {
+		log.Warnf("openai images: create save dir failed: %v", err)
+		return
+	}
+
+	data, err := base64.StdEncoding.DecodeString(result.Result)
+	if err != nil {
+		log.Warnf("openai images: decode generated image failed: %v", err)
+		return
+	}
+
+	callID := strings.TrimSpace(result.CallID)
+	if callID == "" {
+		callID = fmt.Sprintf("img_%d", index)
+	}
+	timestamp := time.Now().Format("20060102_150405")
+	base := fmt.Sprintf("%s_%s_%d", timestamp, callID, index)
+
+	imageFile := base + imageFileExt(result.OutputFormat)
+	if err := os.WriteFile(filepath.Join(imagesSaveDir, imageFile), data, 0o644); err != nil {
+		log.Warnf("openai images: write generated image failed: %v", err)
+		return
+	}
+
+	info := map[string]interface{}{
+		"saved_at":       time.Now().Format(time.RFC3339),
+		"file":           imageFile,
+		"revised_prompt": result.RevisedPrompt,
+	}
+	if metadata.CreatedAt > 0 {
+		info["created"] = metadata.CreatedAt
+	}
+	if result.OutputFormat != "" {
+		info["output_format"] = result.OutputFormat
+	}
+	if result.Size != "" {
+		info["size"] = result.Size
+	}
+	if result.Background != "" {
+		info["background"] = result.Background
+	}
+	if result.Quality != "" {
+		info["quality"] = result.Quality
+	}
+	if result.CallID != "" {
+		info["call_id"] = result.CallID
+	}
+	if len(metadata.UsageRaw) > 0 && json.Valid(metadata.UsageRaw) {
+		info["usage"] = json.RawMessage(metadata.UsageRaw)
+	}
+
+	infoBytes, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		log.Warnf("openai images: marshal image metadata failed: %v", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(imagesSaveDir, base+".info.json"), infoBytes, 0o644); err != nil {
+		log.Warnf("openai images: write image metadata failed: %v", err)
 	}
 }
 
@@ -645,6 +732,7 @@ func extractImagesFromResponsesCompleted(payload []byte) (results []imageCallRes
 				Size:          strings.TrimSpace(item.Get("size").String()),
 				Background:    strings.TrimSpace(item.Get("background").String()),
 				Quality:       strings.TrimSpace(item.Get("quality").String()),
+				CallID:        strings.TrimSpace(item.Get("id").String()),
 			}
 			if len(results) == 0 {
 				firstMeta = entry
@@ -669,7 +757,11 @@ func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw
 		responseFormat = "b64_json"
 	}
 
-	for _, img := range results {
+	for idx, img := range results {
+		saveGeneratedImage(img, idx, imageSaveMetadata{
+			CreatedAt: createdAt,
+			UsageRaw:  usageRaw,
+		})
 		item := []byte(`{}`)
 		if responseFormat == "url" {
 			mt := mimeTypeFromOutputFormat(img.OutputFormat)
@@ -835,7 +927,11 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 					return true
 				}
 				eventName := streamPrefix + ".completed"
-				for _, img := range results {
+				for idx, img := range results {
+					saveGeneratedImage(img, idx, imageSaveMetadata{
+						CreatedAt: gjson.GetBytes(payload, "response.created_at").Int(),
+						UsageRaw:  usageRaw,
+					})
 					data := []byte(`{"type":""}`)
 					data, _ = sjson.SetBytes(data, "type", eventName)
 					if responseFormat == "url" {

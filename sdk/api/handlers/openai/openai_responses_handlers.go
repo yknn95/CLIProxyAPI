@@ -46,6 +46,7 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 
 type responsesSSEFramer struct {
 	pending []byte
+	onFrame func([]byte)
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -61,6 +62,9 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		if frameLen == 0 {
 			break
 		}
+		if f.onFrame != nil {
+			f.onFrame(f.pending[:frameLen])
+		}
 		writeResponsesSSEChunk(w, f.pending[:frameLen])
 		copy(f.pending, f.pending[frameLen:])
 		f.pending = f.pending[:len(f.pending)-frameLen]
@@ -71,6 +75,9 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	}
 	if len(f.pending) == 0 || !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		return
+	}
+	if f.onFrame != nil {
+		f.onFrame(f.pending)
 	}
 	writeResponsesSSEChunk(w, f.pending)
 	f.pending = f.pending[:0]
@@ -87,6 +94,9 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 	if !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		f.pending = f.pending[:0]
 		return
+	}
+	if f.onFrame != nil {
+		f.onFrame(f.pending)
 	}
 	writeResponsesSSEChunk(w, f.pending)
 	f.pending = f.pending[:0]
@@ -330,6 +340,7 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 		cliCancel(errMsg.Error)
 		return
 	}
+	saveImagesFromResponsesPayload(resp)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
@@ -366,7 +377,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	framer := &responsesSSEFramer{}
+	framer := &responsesSSEFramer{onFrame: saveImagesFromResponsesSSEFrame}
 
 	// Peek at the first chunk
 	for {
@@ -416,7 +427,9 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
 	if framer == nil {
-		framer = &responsesSSEFramer{}
+		framer = &responsesSSEFramer{onFrame: saveImagesFromResponsesSSEFrame}
+	} else if framer.onFrame == nil {
+		framer.onFrame = saveImagesFromResponsesSSEFrame
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
