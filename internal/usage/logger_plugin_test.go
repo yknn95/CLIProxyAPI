@@ -108,6 +108,7 @@ func TestBuildUsageLogPayloadIncludesRequestMetadata(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	req.RemoteAddr = "10.65.0.164:12345"
 	req.Header.Set("X-Forwarded-For", "10.65.0.164")
+	req.Header.Set("User-Agent", "CodexCLI/1.2.3")
 	ctx.Request = req
 
 	payload, err := buildUsageLogPayload(context.WithValue(context.Background(), "gin", ctx), coreusage.Record{
@@ -134,6 +135,9 @@ func TestBuildUsageLogPayloadIncludesRequestMetadata(t *testing.T) {
 	if got.URI != "/v1/responses" {
 		t.Fatalf("URI = %q, want %q", got.URI, "/v1/responses")
 	}
+	if got.UserAgent != "CodexCLI/1.2.3" {
+		t.Fatalf("UserAgent = %q, want %q", got.UserAgent, "CodexCLI/1.2.3")
+	}
 	if got.Timestamp == 0 {
 		t.Fatalf("Timestamp = %d, want non-zero", got.Timestamp)
 	}
@@ -157,6 +161,132 @@ func TestBuildUsageLogPayloadIncludesRequestMetadata(t *testing.T) {
 	}
 	if got.CostTime != 12 {
 		t.Fatalf("CostTime = %d, want %d", got.CostTime, 12)
+	}
+	if userAgentIndex, timestampIndex := bytes.Index(payload, []byte(`"UserAgent"`)), bytes.Index(payload, []byte(`"Timestamp"`)); userAgentIndex < 0 || timestampIndex < 0 || userAgentIndex > timestampIndex {
+		t.Fatalf("payload = %s, want UserAgent before Timestamp", string(payload))
+	}
+}
+
+func TestBuildUsageLogPayloadIncludesUsageMetadataFromModelSuffix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set(usageRequestModelContextKey, "gpt-5.4(high)")
+	ctx.Set(usageRequestFormatContextKey, "openai-response")
+
+	payload, err := buildUsageLogPayload(context.WithValue(context.Background(), "gin", ctx), coreusage.Record{
+		Model:  "gpt-5.4",
+		Source: "user@example.com",
+	})
+	if err != nil {
+		t.Fatalf("buildUsageLogPayload error: %v", err)
+	}
+	if !bytes.Contains(payload, []byte(`"Model":"gpt-5.4"`)) {
+		t.Fatalf("payload = %s, want PascalCase Model field", string(payload))
+	}
+	if modelIndex, imageIndex := bytes.Index(payload, []byte(`"Model"`)), bytes.Index(payload, []byte(`"HasImageTool"`)); modelIndex < 0 || imageIndex < 0 || modelIndex > imageIndex {
+		t.Fatalf("payload = %s, want HasImageTool after Model", string(payload))
+	}
+	if !bytes.Contains(payload, []byte(`"ThinkingMode":"high"`)) {
+		t.Fatalf("payload = %s, want PascalCase ThinkingMode field", string(payload))
+	}
+	if thinkingIndex, costIndex := bytes.Index(payload, []byte(`"ThinkingMode"`)), bytes.Index(payload, []byte(`"CostTime"`)); thinkingIndex < 0 || costIndex < 0 || thinkingIndex > costIndex {
+		t.Fatalf("payload = %s, want CostTime after ThinkingMode", string(payload))
+	}
+	if !bytes.Contains(payload, []byte(`"AccountName":"user@example.com"`)) {
+		t.Fatalf("payload = %s, want PascalCase AccountName field", string(payload))
+	}
+
+	var got usageLogEntry
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+	if got.Model != "gpt-5.4" {
+		t.Fatalf("model = %q, want %q", got.Model, "gpt-5.4")
+	}
+	if got.ThinkingMode != "high" {
+		t.Fatalf("thinking_mode = %q, want %q", got.ThinkingMode, "high")
+	}
+	if got.AccountName != "user@example.com" {
+		t.Fatalf("AccountName = %q, want %q", got.AccountName, "user@example.com")
+	}
+}
+
+func TestBuildUsageLogPayloadIncludesThinkingModeFromRequestBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set(usageRequestModelContextKey, "gpt-5.4")
+	ctx.Set(usageRequestFormatContextKey, "openai-response")
+	ctx.Set(usageRequestBodyContextKey, []byte(`{"model":"gpt-5.4","reasoning":{"effort":"xhigh"}}`))
+
+	payload, err := buildUsageLogPayload(context.WithValue(context.Background(), "gin", ctx), coreusage.Record{
+		Model: "gpt-5.4",
+	})
+	if err != nil {
+		t.Fatalf("buildUsageLogPayload error: %v", err)
+	}
+
+	var got usageLogEntry
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+	if got.Model != "gpt-5.4" {
+		t.Fatalf("model = %q, want %q", got.Model, "gpt-5.4")
+	}
+	if got.ThinkingMode != "xhigh" {
+		t.Fatalf("thinking_mode = %q, want %q", got.ThinkingMode, "xhigh")
+	}
+}
+
+func TestBuildUsageLogPayloadIncludesImageGenerationToolFlag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set(usageRequestBodyContextKey, []byte(`{"tools":[{"type":"web_search"},{"type":"image_generation"}]}`))
+
+	payload, err := buildUsageLogPayload(context.WithValue(context.Background(), "gin", ctx), coreusage.Record{})
+	if err != nil {
+		t.Fatalf("buildUsageLogPayload error: %v", err)
+	}
+	if !bytes.Contains(payload, []byte(`"HasImageTool":1`)) {
+		t.Fatalf("payload = %s, want HasImageTool=1", string(payload))
+	}
+
+	var got usageLogEntry
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+	if got.HasImageTool != 1 {
+		t.Fatalf("HasImageTool = %d, want %d", got.HasImageTool, 1)
+	}
+}
+
+func TestBuildUsageLogPayloadIncludesImageGenerationToolChoiceFlag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set(usageRequestBodyContextKey, []byte(`{"tool_choice":{"type":"image_generation"}}`))
+
+	payload, err := buildUsageLogPayload(context.WithValue(context.Background(), "gin", ctx), coreusage.Record{})
+	if err != nil {
+		t.Fatalf("buildUsageLogPayload error: %v", err)
+	}
+
+	var got usageLogEntry
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+	if got.HasImageTool != 1 {
+		t.Fatalf("HasImageTool = %d, want %d", got.HasImageTool, 1)
 	}
 }
 
@@ -201,6 +331,30 @@ func TestLoggerPluginHandleUsageWritesDedicatedUsageLog(t *testing.T) {
 	}
 	if !bytes.Contains(sink.lines[0], []byte(`"CostTime":8`)) {
 		t.Fatalf("log output = %q, want latency", string(sink.lines[0]))
+	}
+}
+
+func TestLoggerPluginHandleUsageWritesAdditionalUsageLogWithRecordModel(t *testing.T) {
+	sink := &memoryUsageLogWriter{}
+	prevSink := usageLogSink
+	usageLogSink = sink
+	defer func() { usageLogSink = prevSink }()
+
+	plugin := &LoggerPlugin{stats: NewRequestStatistics()}
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Model:      "gpt-image-2",
+		Additional: true,
+		Detail: coreusage.Detail{
+			InputTokens: 1,
+			TotalTokens: 1,
+		},
+	})
+
+	if len(sink.lines) != 1 {
+		t.Fatalf("logged lines = %d, want 1", len(sink.lines))
+	}
+	if !bytes.Contains(sink.lines[0], []byte(`"Model":"gpt-image-2"`)) {
+		t.Fatalf("log output = %q, want additional record model", string(sink.lines[0]))
 	}
 }
 

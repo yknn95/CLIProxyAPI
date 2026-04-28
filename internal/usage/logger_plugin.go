@@ -10,13 +10,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/tidwall/gjson"
 )
 
 var statisticsEnabled atomic.Bool
@@ -45,12 +48,17 @@ type usageLogEntry struct {
 	TimestampText   string `json:"TimestampText"`
 	IP              string `json:"IP"`
 	URI             string `json:"URI"`
+	Model           string `json:"Model"`
+	HasImageTool    int    `json:"HasImageTool"`
+	ThinkingMode    string `json:"ThinkingMode"`
+	CostTime        int64  `json:"CostTime"`
+	AccountName     string `json:"AccountName"`
 	InputTokens     int64  `json:"InputTokens"`
 	OutputTokens    int64  `json:"OutputTokens"`
 	ReasoningTokens int64  `json:"ReasoningTokens"`
 	CachedTokens    int64  `json:"CachedTokens"`
 	Tokens          int64  `json:"Tokens"`
-	CostTime        int64  `json:"CostTime"`
+	UserAgent       string `json:"UserAgent"`
 	Timestamp       int64  `json:"Timestamp"`
 }
 
@@ -561,15 +569,260 @@ func buildUsageLogPayload(ctx context.Context, record coreusage.Record) ([]byte,
 		TimestampText:   timestamp.Format(time.RFC3339),
 		IP:              resolveClientIP(ctx),
 		URI:             resolveRequestURI(ctx),
+		Model:           resolveUsageModel(ctx, record),
+		HasImageTool:    resolveHasImageGenerationTool(ctx),
+		ThinkingMode:    resolveUsageThinkingMode(ctx, record),
+		CostTime:        normaliseLatency(record.Latency),
+		AccountName:     strings.TrimSpace(record.Source),
 		InputTokens:     detail.InputTokens,
 		OutputTokens:    detail.OutputTokens,
 		ReasoningTokens: detail.ReasoningTokens,
 		CachedTokens:    detail.CachedTokens,
 		Tokens:          detail.TotalTokens,
-		CostTime:        normaliseLatency(record.Latency),
+		UserAgent:       resolveUserAgent(ctx),
 		Timestamp:       timestamp.Unix(),
 	}
 	return json.Marshal(entry)
+}
+
+const (
+	usageRequestModelContextKey  = "usage_request_model"
+	usageRequestBodyContextKey   = "usage_request_body"
+	usageRequestFormatContextKey = "usage_request_format"
+)
+
+func resolveUsageModel(ctx context.Context, record coreusage.Record) string {
+	model := strings.TrimSpace(record.Model)
+	if model == "" {
+		model = strings.TrimSpace(resolveUsageOriginalModel(ctx))
+	}
+	return strings.TrimSpace(thinking.ParseSuffix(model).ModelName)
+}
+
+func resolveUsageThinkingMode(ctx context.Context, record coreusage.Record) string {
+	if mode := thinkingModeFromModel(resolveUsageOriginalModel(ctx)); mode != "" {
+		return mode
+	}
+	body := resolveUsageRequestBody(ctx)
+	if len(body) == 0 {
+		return ""
+	}
+	format := strings.ToLower(strings.TrimSpace(resolveUsageRequestFormat(ctx)))
+	if format == "" {
+		format = strings.ToLower(strings.TrimSpace(record.Provider))
+	}
+	return thinkingModeFromRequestBody(body, format)
+}
+
+func resolveUsageOriginalModel(ctx context.Context) string {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx == nil {
+		return ""
+	}
+	if value, exists := ginCtx.Get(usageRequestModelContextKey); exists {
+		return stringValue(value)
+	}
+	return ""
+}
+
+func resolveUsageRequestFormat(ctx context.Context) string {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx == nil {
+		return ""
+	}
+	if value, exists := ginCtx.Get(usageRequestFormatContextKey); exists {
+		return stringValue(value)
+	}
+	return ""
+}
+
+func resolveUsageRequestBody(ctx context.Context) []byte {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx == nil {
+		return nil
+	}
+	value, exists := ginCtx.Get(usageRequestBodyContextKey)
+	if !exists {
+		return nil
+	}
+	switch body := value.(type) {
+	case []byte:
+		return body
+	case string:
+		return []byte(body)
+	default:
+		return nil
+	}
+}
+
+func resolveHasImageGenerationTool(ctx context.Context) int {
+	if hasImageGenerationTool(resolveUsageRequestBody(ctx)) {
+		return 1
+	}
+	return 0
+}
+
+func hasImageGenerationTool(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		if isImageGenerationType(tool.Get("type").String()) {
+			return true
+		}
+	}
+	if isImageGenerationType(gjson.GetBytes(body, "tool_choice.type").String()) {
+		return true
+	}
+	for _, tool := range gjson.GetBytes(body, "tool_choice.tools").Array() {
+		if isImageGenerationType(tool.Get("type").String()) {
+			return true
+		}
+	}
+	return false
+}
+
+func isImageGenerationType(toolType string) bool {
+	return strings.EqualFold(strings.TrimSpace(toolType), "image_generation")
+}
+
+func stringValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		if value == nil {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprintf("%v", value))
+	}
+}
+
+func thinkingModeFromModel(model string) string {
+	suffix := thinking.ParseSuffix(strings.TrimSpace(model))
+	if !suffix.HasSuffix {
+		return ""
+	}
+	return thinkingModeFromRawValue(suffix.RawSuffix)
+}
+
+func thinkingModeFromRequestBody(body []byte, format string) string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ""
+	}
+	switch format {
+	case "claude":
+		return thinkingModeFromClaudeBody(body)
+	case "gemini", "gemini-cli", "antigravity":
+		return thinkingModeFromGeminiBody(body, format)
+	case "openai-response", "codex":
+		if mode := thinkingModeFromPath(body, "reasoning.effort"); mode != "" {
+			return mode
+		}
+	case "openai", "kimi":
+		if mode := thinkingModeFromPath(body, "reasoning_effort"); mode != "" {
+			return mode
+		}
+	}
+	return thinkingModeFromGenericBody(body)
+}
+
+func thinkingModeFromGenericBody(body []byte) string {
+	if mode := thinkingModeFromPath(body, "reasoning.effort"); mode != "" {
+		return mode
+	}
+	if mode := thinkingModeFromPath(body, "reasoning_effort"); mode != "" {
+		return mode
+	}
+	if mode := thinkingModeFromClaudeBody(body); mode != "" {
+		return mode
+	}
+	if mode := thinkingModeFromGeminiBody(body, "gemini"); mode != "" {
+		return mode
+	}
+	return thinkingModeFromGeminiBody(body, "gemini-cli")
+}
+
+func thinkingModeFromClaudeBody(body []byte) string {
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
+	if thinkingType == "disabled" {
+		return "none"
+	}
+	if thinkingType == "adaptive" || thinkingType == "auto" {
+		if mode := thinkingModeFromPath(body, "output_config.effort"); mode != "" {
+			return mode
+		}
+	}
+	if budget := gjson.GetBytes(body, "thinking.budget_tokens"); budget.Exists() {
+		return thinkingModeFromBudget(budget.Int())
+	}
+	if thinkingType == "enabled" {
+		return "auto"
+	}
+	return ""
+}
+
+func thinkingModeFromGeminiBody(body []byte, format string) string {
+	prefix := "generationConfig.thinkingConfig"
+	if format == "gemini-cli" || format == "antigravity" {
+		prefix = "request.generationConfig.thinkingConfig"
+	}
+	if mode := thinkingModeFromPath(body, prefix+".thinkingLevel"); mode != "" {
+		return mode
+	}
+	if mode := thinkingModeFromPath(body, prefix+".thinking_level"); mode != "" {
+		return mode
+	}
+	if budget := gjson.GetBytes(body, prefix+".thinkingBudget"); budget.Exists() {
+		return thinkingModeFromBudget(budget.Int())
+	}
+	if budget := gjson.GetBytes(body, prefix+".thinking_budget"); budget.Exists() {
+		return thinkingModeFromBudget(budget.Int())
+	}
+	return ""
+}
+
+func thinkingModeFromPath(body []byte, path string) string {
+	value := gjson.GetBytes(body, path)
+	if !value.Exists() {
+		return ""
+	}
+	if value.Type == gjson.Number {
+		return thinkingModeFromBudget(value.Int())
+	}
+	return thinkingModeFromRawValue(value.String())
+}
+
+func thinkingModeFromRawValue(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return ""
+	}
+	if mode, ok := thinking.ParseSpecialSuffix(raw); ok {
+		return mode.String()
+	}
+	if level, ok := thinking.ParseLevelSuffix(raw); ok {
+		return string(level)
+	}
+	if budget, ok := thinking.ParseNumericSuffix(raw); ok {
+		return thinkingModeFromBudget(int64(budget))
+	}
+	return raw
+}
+
+func thinkingModeFromBudget(budget int64) string {
+	switch budget {
+	case -1:
+		return "auto"
+	case 0:
+		return "none"
+	default:
+		return strconv.FormatInt(budget, 10)
+	}
 }
 
 func resolveUsageLogTimestamp(record coreusage.Record) time.Time {
@@ -612,6 +865,14 @@ func resolveRequestURI(ctx context.Context) string {
 		}
 	}
 	return strings.TrimSpace(ginCtx.FullPath())
+}
+
+func resolveUserAgent(ctx context.Context) string {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	return strings.TrimSpace(ginCtx.Request.UserAgent())
 }
 
 func resolveGinContext(ctx context.Context) *gin.Context {

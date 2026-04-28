@@ -50,6 +50,9 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	usageRequestModelContextKey      = "usage_request_model"
+	usageRequestBodyContextKey       = "usage_request_body"
+	usageRequestFormatContextKey     = "usage_request_format"
 )
 
 type pinnedAuthContextKey struct{}
@@ -221,6 +224,21 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+func attachUsageRequestMetadata(ctx context.Context, handlerType, modelName string, rawJSON []byte) {
+	if ctx == nil {
+		return
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return
+	}
+	ginCtx.Set(usageRequestModelContextKey, modelName)
+	ginCtx.Set(usageRequestFormatContextKey, handlerType)
+	if len(rawJSON) > 0 {
+		ginCtx.Set(usageRequestBodyContextKey, bytes.Clone(rawJSON))
+	}
 }
 
 // headersFromContext extracts the original HTTP request headers from the gin context
@@ -506,6 +524,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	attachUsageRequestMetadata(ctx, handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -554,6 +573,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	attachUsageRequestMetadata(ctx, handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -606,6 +626,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	attachUsageRequestMetadata(ctx, handlerType, normalizedModel, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON

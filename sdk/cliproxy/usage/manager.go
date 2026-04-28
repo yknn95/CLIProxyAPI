@@ -20,6 +20,7 @@ type Record struct {
 	RequestedAt time.Time
 	Latency     time.Duration
 	Failed      bool
+	Additional  bool
 	Detail      Detail
 }
 

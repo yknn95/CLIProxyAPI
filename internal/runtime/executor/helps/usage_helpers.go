@@ -27,6 +27,8 @@ type UsageReporter struct {
 	once        sync.Once
 }
 
+const usageRequestBodyContextKey = "usage_request_body"
+
 func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
 	apiKey := APIKeyFromContext(ctx)
 	reporter := &UsageReporter{
@@ -46,6 +48,20 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 
 func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) {
 	r.publishWithOutcome(ctx, detail, false)
+}
+
+func SetUsageRequestBody(ctx context.Context, body []byte) {
+	if ctx == nil {
+		return
+	}
+	if len(body) == 0 {
+		return
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return
+	}
+	ginCtx.Set(usageRequestBodyContextKey, bytes.Clone(body))
 }
 
 func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string, detail usage.Detail) {
@@ -68,7 +84,9 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
-	return r.buildRecordForModel(model, detail, false), true
+	record := r.buildRecordForModel(model, detail, false)
+	record.Additional = true
+	return record, true
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context) {
