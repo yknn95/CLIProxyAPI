@@ -26,6 +26,8 @@ import (
 const (
 	defaultImagesMainModel = "gpt-5.4-mini"
 	defaultImagesToolModel = "gpt-image-2"
+	imagesGenerationsPath  = "/v1/images/generations"
+	imagesEditsPath        = "/v1/images/edits"
 )
 
 var imagesSaveDir = "/tmp/images"
@@ -107,6 +109,28 @@ func (a *sseFrameAccumulator) Flush() [][]byte {
 	}
 	a.pending = nil
 	return frames
+}
+
+func isSupportedImagesModel(model string) bool {
+	baseModel := strings.TrimSpace(model)
+	if idx := strings.LastIndex(baseModel, "/"); idx >= 0 && idx < len(baseModel)-1 {
+		baseModel = strings.TrimSpace(baseModel[idx+1:])
+	}
+	return baseModel == defaultImagesToolModel
+}
+
+func rejectUnsupportedImagesModel(c *gin.Context, model string) bool {
+	if isSupportedImagesModel(model) {
+		return false
+	}
+
+	c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		Error: handlers.ErrorDetail{
+			Message: fmt.Sprintf("Model %s is not supported on %s or %s. Use %s.", model, imagesGenerationsPath, imagesEditsPath, defaultImagesToolModel),
+			Type:    "invalid_request_error",
+		},
+	})
+	return true
 }
 
 func mimeTypeFromOutputFormat(outputFormat string) string {
@@ -281,6 +305,14 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 		return
 	}
 
+	imageModel := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+	if imageModel == "" {
+		imageModel = defaultImagesToolModel
+	}
+	if rejectUnsupportedImagesModel(c, imageModel) {
+		return
+	}
+
 	prompt := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt").String())
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -292,10 +324,6 @@ func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 		return
 	}
 
-	imageModel := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-	if imageModel == "" {
-		imageModel = defaultImagesToolModel
-	}
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
 	if responseFormat == "" {
 		responseFormat = "b64_json"
@@ -370,6 +398,14 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		return
 	}
 
+	imageModel := strings.TrimSpace(c.PostForm("model"))
+	if imageModel == "" {
+		imageModel = defaultImagesToolModel
+	}
+	if rejectUnsupportedImagesModel(c, imageModel) {
+		return
+	}
+
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -427,10 +463,6 @@ func (h *OpenAIAPIHandler) imagesEditsFromMultipart(c *gin.Context) {
 		maskDataURL = &dataURL
 	}
 
-	imageModel := strings.TrimSpace(c.PostForm("model"))
-	if imageModel == "" {
-		imageModel = defaultImagesToolModel
-	}
 	responseFormat := strings.TrimSpace(c.PostForm("response_format"))
 	if responseFormat == "" {
 		responseFormat = "b64_json"
@@ -499,6 +531,14 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 		return
 	}
 
+	imageModel := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+	if imageModel == "" {
+		imageModel = defaultImagesToolModel
+	}
+	if rejectUnsupportedImagesModel(c, imageModel) {
+		return
+	}
+
 	prompt := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt").String())
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -547,10 +587,6 @@ func (h *OpenAIAPIHandler) imagesEditsFromJSON(c *gin.Context) {
 		return
 	}
 
-	imageModel := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-	if imageModel == "" {
-		imageModel = defaultImagesToolModel
-	}
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawJSON, "response_format").String())
 	if responseFormat == "" {
 		responseFormat = "b64_json"
