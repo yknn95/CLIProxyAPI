@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -110,6 +111,97 @@ func (a *sseFrameAccumulator) Flush() [][]byte {
 	}
 	a.pending = nil
 	return frames
+}
+
+func imagesResponsesErrorStatus(errType string, errCode string, fallback int) int {
+	errType = strings.ToLower(strings.TrimSpace(errType))
+	errCode = strings.ToLower(strings.TrimSpace(errCode))
+
+	switch {
+	case errType == "authentication_error" || errCode == "invalid_api_key":
+		return http.StatusUnauthorized
+	case errType == "permission_error" || errCode == "insufficient_quota":
+		return http.StatusForbidden
+	case errType == "rate_limit_error" || errCode == "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case errCode == "model_not_found":
+		return http.StatusNotFound
+	case errCode == "request_timeout":
+		return http.StatusRequestTimeout
+	case errType == "server_error" || errCode == "internal_server_error":
+		return http.StatusInternalServerError
+	}
+
+	if fallback > 0 {
+		return fallback
+	}
+	return http.StatusBadGateway
+}
+
+func buildImagesResponsesErrorMessage(errorRaw string, fallbackStatus int, fallbackMessage string) *interfaces.ErrorMessage {
+	errType := strings.TrimSpace(gjson.Get(errorRaw, "type").String())
+	errCode := strings.TrimSpace(gjson.Get(errorRaw, "code").String())
+	errMessage := strings.TrimSpace(gjson.Get(errorRaw, "message").String())
+	status := imagesResponsesErrorStatus(errType, errCode, fallbackStatus)
+	if errMessage == "" {
+		errMessage = strings.TrimSpace(fallbackMessage)
+	}
+	if errMessage == "" {
+		errMessage = http.StatusText(status)
+	}
+
+	body := []byte(`{"error":{}}`)
+	if strings.TrimSpace(errorRaw) != "" && json.Valid([]byte(errorRaw)) {
+		body, _ = sjson.SetRawBytes(body, "error", []byte(errorRaw))
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.message").String()) == "" {
+		body, _ = sjson.SetBytes(body, "error.message", errMessage)
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.code").String()) == "" && errCode != "" {
+		body, _ = sjson.SetBytes(body, "error.code", errCode)
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.type").String()) == "" {
+		switch status {
+		case http.StatusUnauthorized:
+			body, _ = sjson.SetBytes(body, "error.type", "authentication_error")
+		case http.StatusForbidden:
+			body, _ = sjson.SetBytes(body, "error.type", "permission_error")
+		case http.StatusTooManyRequests:
+			body, _ = sjson.SetBytes(body, "error.type", "rate_limit_error")
+		default:
+			if status >= http.StatusInternalServerError {
+				body, _ = sjson.SetBytes(body, "error.type", "server_error")
+			} else {
+				body, _ = sjson.SetBytes(body, "error.type", "invalid_request_error")
+			}
+		}
+	}
+
+	return &interfaces.ErrorMessage{
+		StatusCode: status,
+		Error:      errors.New(string(body)),
+	}
+}
+
+func parseImagesResponsesTerminalError(payload []byte) *interfaces.ErrorMessage {
+	if !json.Valid(payload) {
+		return nil
+	}
+
+	root := gjson.ParseBytes(payload)
+	switch root.Get("type").String() {
+	case "error":
+		status := int(root.Get("status").Int())
+		return buildImagesResponsesErrorMessage(root.Get("error").Raw, status, "upstream error")
+	case "response.failed":
+		status := int(root.Get("status").Int())
+		if status <= 0 {
+			status = int(root.Get("response.status_code").Int())
+		}
+		return buildImagesResponsesErrorMessage(root.Get("response.error").Raw, status, "response failed")
+	default:
+		return nil
+	}
 }
 
 func isSupportedImagesModel(model string) bool {
@@ -716,7 +808,11 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 				return nil, false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("invalid SSE data JSON")}
 			}
 
-			if gjson.GetBytes(payload, "type").String() != "response.completed" {
+			switch gjson.GetBytes(payload, "type").String() {
+			case "error", "response.failed":
+				return nil, false, parseImagesResponsesTerminalError(payload)
+			case "response.completed":
+			default:
 				continue
 			}
 

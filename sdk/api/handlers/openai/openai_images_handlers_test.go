@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
@@ -230,5 +232,65 @@ func TestImagesEdits_DisableImageGenerationChat_DoesNotReturn404(t *testing.T) {
 
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+}
+
+func TestCollectImagesFromResponsesStream_ReturnsResponseFailedError(t *testing.T) {
+	ctx := context.Background()
+	dataCh := make(chan []byte, 1)
+	errCh := make(chan *interfaces.ErrorMessage)
+
+	dataCh <- []byte("data: " + `{"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"please retry later"}}}` + "\n\n")
+	close(dataCh)
+	close(errCh)
+
+	out, errMsg := collectImagesFromResponsesStream(ctx, dataCh, errCh, "b64_json")
+	if out != nil {
+		t.Fatalf("expected no output, got %s", string(out))
+	}
+	if errMsg == nil {
+		t.Fatal("expected error message")
+	}
+	if errMsg.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusTooManyRequests)
+	}
+	if got := gjson.Get(errMsg.Error.Error(), "error.message").String(); got != "please retry later" {
+		t.Fatalf("message = %q, want %q", got, "please retry later")
+	}
+	if got := gjson.Get(errMsg.Error.Error(), "error.code").String(); got != "rate_limit_exceeded" {
+		t.Fatalf("code = %q, want %q", got, "rate_limit_exceeded")
+	}
+	if got := gjson.Get(errMsg.Error.Error(), "error.type").String(); got != "rate_limit_error" {
+		t.Fatalf("type = %q, want %q", got, "rate_limit_error")
+	}
+}
+
+func TestCollectImagesFromResponsesStream_ReturnsErrorEvent(t *testing.T) {
+	ctx := context.Background()
+	dataCh := make(chan []byte, 1)
+	errCh := make(chan *interfaces.ErrorMessage)
+
+	dataCh <- []byte("data: " + `{"type":"error","status":500,"error":{"type":"server_error","code":"internal_server_error","message":"upstream exploded"}}` + "\n\n")
+	close(dataCh)
+	close(errCh)
+
+	out, errMsg := collectImagesFromResponsesStream(ctx, dataCh, errCh, "b64_json")
+	if out != nil {
+		t.Fatalf("expected no output, got %s", string(out))
+	}
+	if errMsg == nil {
+		t.Fatal("expected error message")
+	}
+	if errMsg.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusInternalServerError)
+	}
+	if got := gjson.Get(errMsg.Error.Error(), "error.message").String(); got != "upstream exploded" {
+		t.Fatalf("message = %q, want %q", got, "upstream exploded")
+	}
+	if got := gjson.Get(errMsg.Error.Error(), "error.code").String(); got != "internal_server_error" {
+		t.Fatalf("code = %q, want %q", got, "internal_server_error")
+	}
+	if got := gjson.Get(errMsg.Error.Error(), "error.type").String(); got != "server_error" {
+		t.Fatalf("type = %q, want %q", got, "server_error")
 	}
 }
