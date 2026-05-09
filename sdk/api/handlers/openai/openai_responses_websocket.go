@@ -83,6 +83,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	var wsTerminateErr error
 	var wsTimelineLog strings.Builder
+	var lastRequest []byte
+	lastResponseOutput := []byte("[]")
+	pinnedAuthID := ""
+	forceTranscriptReplayNextRequest := false
 	defer func() {
 		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
 		if wsTerminateErr != nil {
@@ -100,11 +104,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			log.Warnf("responses websocket: close connection error: %v", errClose)
 		}
 	}()
-
-	var lastRequest []byte
-	lastResponseOutput := []byte("[]")
-	pinnedAuthID := ""
-	forceTranscriptReplayNextRequest := false
 
 	for {
 		msgType, payload, errReadMessage := conn.ReadMessage()

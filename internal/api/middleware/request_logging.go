@@ -95,6 +95,9 @@ func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
 	if req == nil || req.Body == nil {
 		return false
 	}
+	if isResponsesRequest(req) {
+		return false
+	}
 	contentType := strings.ToLower(strings.TrimSpace(req.Header.Get("Content-Type")))
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		return false
@@ -103,6 +106,13 @@ func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
 		return false
 	}
 	return req.ContentLength <= maxErrorOnlyCapturedRequestBodyBytes
+}
+
+func isResponsesRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	return req.URL.Path == "/v1/responses"
 }
 
 // captureRequestInfo extracts relevant information from the incoming HTTP request.

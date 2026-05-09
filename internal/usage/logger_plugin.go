@@ -588,6 +588,7 @@ func buildUsageLogPayload(ctx context.Context, record coreusage.Record) ([]byte,
 const (
 	usageRequestModelContextKey  = "usage_request_model"
 	usageRequestBodyContextKey   = "usage_request_body"
+	usageHasImageToolContextKey  = "usage_has_image_tool"
 	usageRequestFormatContextKey = "usage_request_format"
 )
 
@@ -656,6 +657,28 @@ func resolveUsageRequestBody(ctx context.Context) []byte {
 }
 
 func resolveHasImageGenerationTool(ctx context.Context) int {
+	ginCtx := resolveGinContext(ctx)
+	if ginCtx != nil {
+		if value, exists := ginCtx.Get(usageHasImageToolContextKey); exists {
+			switch flag := value.(type) {
+			case bool:
+				if flag {
+					return 1
+				}
+				return 0
+			case int:
+				if flag != 0 {
+					return 1
+				}
+				return 0
+			case int64:
+				if flag != 0 {
+					return 1
+				}
+				return 0
+			}
+		}
+	}
 	if hasImageGenerationTool(resolveUsageRequestBody(ctx)) {
 		return 1
 	}

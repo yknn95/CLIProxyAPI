@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,11 +19,15 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+const maxResponsesRequestBodyBytes int64 = 100 << 20
 
 func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 	if w == nil || len(chunk) == 0 {
@@ -375,15 +380,8 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
-	rawJSON, err := c.GetRawData()
-	// If data retrieval fails, return a 400 Bad Request error.
+	rawJSON, err := readBoundedResponsesRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: fmt.Sprintf("Invalid request: %v", err),
-				Type:    "invalid_request_error",
-			},
-		})
 		return
 	}
 
@@ -397,15 +395,76 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 
 }
 
-func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
+func readBoundedResponsesRequestBody(c *gin.Context) ([]byte, error) {
+	if c == nil || c.Request == nil {
+		return nil, fmt.Errorf("request is nil")
+	}
+	if c.Request.ContentLength > maxResponsesRequestBodyBytes {
+		logOversizedResponsesRequest(c, nil, c.Request.ContentLength)
+		c.JSON(http.StatusRequestEntityTooLarge, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Request body too large: limit is %d bytes", maxResponsesRequestBodyBytes),
+				Type:    "invalid_request_error",
+				Code:    "payload_too_large",
+			},
+		})
+		return nil, fmt.Errorf("request body too large: content-length=%d", c.Request.ContentLength)
+	}
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxResponsesRequestBodyBytes)
 	rawJSON, err := c.GetRawData()
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			logOversizedResponsesRequest(c, rawJSON, maxResponsesRequestBodyBytes+1)
+			c.JSON(http.StatusRequestEntityTooLarge, handlers.ErrorResponse{
+				Error: handlers.ErrorDetail{
+					Message: fmt.Sprintf("Request body too large: limit is %d bytes", maxResponsesRequestBodyBytes),
+					Type:    "invalid_request_error",
+					Code:    "payload_too_large",
+				},
+			})
+			return nil, err
+		}
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",
 			},
 		})
+		return nil, err
+	}
+	return rawJSON, nil
+}
+
+func logOversizedResponsesRequest(c *gin.Context, rawJSON []byte, measuredBytes int64) {
+	if c == nil || c.Request == nil {
+		return
+	}
+	requestID := logging.GetGinRequestID(c)
+	path := ""
+	if c.Request.URL != nil {
+		path = c.Request.URL.Path
+	}
+	modelName := ""
+	if len(rawJSON) > 0 && gjson.ValidBytes(rawJSON) {
+		modelName = gjson.GetBytes(rawJSON, "model").String()
+	}
+	log.Warnf(
+		"diag.mem oversized responses request request_id=%s path=%s content_length=%d measured_bytes=%d limit_bytes=%d client_ip=%s model=%s",
+		requestID,
+		path,
+		c.Request.ContentLength,
+		measuredBytes,
+		maxResponsesRequestBodyBytes,
+		c.ClientIP(),
+		modelName,
+	)
+}
+
+func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
+	rawJSON, err := readBoundedResponsesRequestBody(c)
+	if err != nil {
 		return
 	}
 

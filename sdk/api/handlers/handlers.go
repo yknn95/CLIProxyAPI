@@ -22,6 +22,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -52,6 +53,7 @@ const (
 	defaultStreamingBootstrapRetries = 0
 	usageRequestModelContextKey      = "usage_request_model"
 	usageRequestBodyContextKey       = "usage_request_body"
+	usageHasImageToolContextKey      = "usage_has_image_tool"
 	usageRequestFormatContextKey     = "usage_request_format"
 )
 
@@ -245,8 +247,28 @@ func attachUsageRequestMetadata(ctx context.Context, handlerType, modelName stri
 	ginCtx.Set(usageRequestModelContextKey, modelName)
 	ginCtx.Set(usageRequestFormatContextKey, handlerType)
 	if len(rawJSON) > 0 {
-		ginCtx.Set(usageRequestBodyContextKey, bytes.Clone(rawJSON))
+		ginCtx.Set(usageHasImageToolContextKey, requestHasImageGenerationTool(rawJSON))
 	}
+}
+
+func requestHasImageGenerationTool(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "tool_choice.type").String()), "image_generation") {
+		return true
+	}
+	for _, tool := range gjson.GetBytes(body, "tool_choice.tools").Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	return false
 }
 
 // headersFromContext extracts the original HTTP request headers from the gin context
