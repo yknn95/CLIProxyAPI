@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -33,6 +36,8 @@ const (
 	codexUserAgent             = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 	codexOriginator            = "codex_cli_rs"
 	codexDefaultImageToolModel = "gpt-image-2"
+	codexProxyRetryAttempts    = 3
+	codexProxyRetryDelay       = time.Second
 )
 
 var dataTag = []byte("data:")
@@ -210,95 +215,35 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
+	attempts := codexRetryAttemptCount(e.cfg, auth)
+	for attempt := 0; attempt < attempts; attempt++ {
+		httpResp, errRequest := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
+			httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+			if errBuild != nil {
+				return nil, errBuild
+			}
+			applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+			return httpReq, nil
+		})
+		if errRequest != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRequest)
+			return resp, errRequest
+		}
+
+		respAttempt, errAttempt, retryable := e.finishCodexNonStreamResponse(ctx, reporter, httpResp, req.Model, from, to, originalPayload, body)
+		if errAttempt == nil {
+			return respAttempt, nil
+		}
+		resp = respAttempt
+		err = errAttempt
+		if !retryable || attempt >= attempts-1 {
+			return resp, err
+		}
+		helps.LogWithRequestID(ctx).Warnf("codex executor: transient proxy completion failure, retrying attempt %d/%d in %s: %v", attempt+1, attempts-1, codexProxyRetryDelay, errAttempt)
+		if errWait := waitCodexProxyRetry(ctx, codexProxyRetryDelay); errWait != nil {
+			return resp, errWait
+		}
 	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("codex executor: close response body error: %v", errClose)
-		}
-	}()
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
-		return resp, err
-	}
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-
-	lines := bytes.Split(data, []byte("\n"))
-	outputItemsByIndex := make(map[int64][]byte)
-	var outputItemsFallback [][]byte
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, dataTag) {
-			continue
-		}
-
-		eventData := bytes.TrimSpace(line[5:])
-		eventType := gjson.GetBytes(eventData, "type").String()
-
-		if eventType == "response.output_item.done" {
-			itemResult := gjson.GetBytes(eventData, "item")
-			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
-				continue
-			}
-			outputIndexResult := gjson.GetBytes(eventData, "output_index")
-			if outputIndexResult.Exists() {
-				outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
-			} else {
-				outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
-			}
-			continue
-		}
-
-		if eventType != "response.completed" {
-			continue
-		}
-
-		if detail, ok := helps.ParseCodexUsage(eventData); ok {
-			reporter.Publish(ctx, detail)
-		}
-		publishCodexImageToolUsage(ctx, reporter, body, eventData)
-
-		completedData := eventData
-		outputResult := gjson.GetBytes(completedData, "response.output")
-		shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-		if shouldPatchOutput {
-			completedDataPatched := completedData
-			completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
-
-			indexes := make([]int64, 0, len(outputItemsByIndex))
-			for idx := range outputItemsByIndex {
-				indexes = append(indexes, idx)
-			}
-			sort.Slice(indexes, func(i, j int) bool {
-				return indexes[i] < indexes[j]
-			})
-			for _, idx := range indexes {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
-			}
-			for _, item := range outputItemsFallback {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
-			}
-			completedData = completedDataPatched
-		}
-
-		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedData, &param)
-		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
-		return resp, nil
-	}
-	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
 	return resp, err
 }
 
@@ -362,8 +307,14 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
+		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+		return httpReq, nil
+	})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -461,9 +412,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
+		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		return httpReq, nil
+	})
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
@@ -570,6 +526,202 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
 	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, []byte(usageJSON))
 	return cliproxyexecutor.Response{Payload: translated}, nil
+}
+
+func (e *CodexExecutor) doCodexRequest(ctx context.Context, auth *cliproxyauth.Auth, buildRequest func() (*http.Request, error)) (*http.Response, error) {
+	return doCodexRequestWithRetry(ctx, codexProxyConfigured(e.cfg, auth), buildRequest, func(req *http.Request) (*http.Response, error) {
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		return httpClient.Do(req)
+	})
+}
+
+func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, reporter *helps.UsageReporter, httpResp *http.Response, requestModel string, from sdktranslator.Format, to sdktranslator.Format, originalPayload []byte, body []byte) (cliproxyexecutor.Response, error, bool) {
+	var resp cliproxyexecutor.Response
+	if httpResp == nil {
+		return resp, errors.New("codex executor: nil http response"), false
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close response body error: %v", errClose)
+		}
+	}()
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		b, _ := io.ReadAll(httpResp.Body)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		return resp, newCodexStatusErr(httpResp.StatusCode, b), false
+	}
+	data, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return resp, err, shouldRetryCodexCompletionError(e.cfg, nil, err)
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+
+	lines := bytes.Split(data, []byte("\n"))
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
+	for _, line := range lines {
+		if !bytes.HasPrefix(line, dataTag) {
+			continue
+		}
+
+		eventData := bytes.TrimSpace(line[5:])
+		eventType := gjson.GetBytes(eventData, "type").String()
+
+		if eventType == "response.output_item.done" {
+			itemResult := gjson.GetBytes(eventData, "item")
+			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
+				continue
+			}
+			outputIndexResult := gjson.GetBytes(eventData, "output_index")
+			if outputIndexResult.Exists() {
+				outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
+			} else {
+				outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
+			}
+			continue
+		}
+
+		if eventType != "response.completed" {
+			continue
+		}
+
+		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+			reporter.Publish(ctx, detail)
+		}
+		publishCodexImageToolUsage(ctx, reporter, body, eventData)
+
+		completedData := eventData
+		outputResult := gjson.GetBytes(completedData, "response.output")
+		shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
+		if shouldPatchOutput {
+			completedDataPatched := completedData
+			completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
+
+			indexes := make([]int64, 0, len(outputItemsByIndex))
+			for idx := range outputItemsByIndex {
+				indexes = append(indexes, idx)
+			}
+			sort.Slice(indexes, func(i, j int) bool {
+				return indexes[i] < indexes[j]
+			})
+			for _, idx := range indexes {
+				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
+			}
+			for _, item := range outputItemsFallback {
+				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
+			}
+			completedData = completedDataPatched
+		}
+
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, from, requestModel, originalPayload, body, completedData, &param)
+		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
+		return resp, nil, false
+	}
+
+	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	return resp, err, shouldRetryCodexCompletionError(e.cfg, nil, err)
+}
+
+func doCodexRequestWithRetry(ctx context.Context, proxyEnabled bool, buildRequest func() (*http.Request, error), do func(*http.Request) (*http.Response, error)) (*http.Response, error) {
+	attempts := codexRetryAttemptCountForProxy(proxyEnabled)
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		req, err := buildRequest()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := do(req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !proxyEnabled || attempt >= attempts-1 || !shouldRetryCodexTransportError(err) {
+			return nil, err
+		}
+		helps.LogWithRequestID(ctx).Warnf("codex executor: transient proxy transport failure before response, retrying attempt %d/%d in %s: %v", attempt+1, attempts-1, codexProxyRetryDelay, err)
+		if errWait := waitCodexProxyRetry(ctx, codexProxyRetryDelay); errWait != nil {
+			return nil, errWait
+		}
+	}
+	return nil, lastErr
+}
+
+func codexRetryAttemptCount(cfg *config.Config, auth *cliproxyauth.Auth) int {
+	return codexRetryAttemptCountForProxy(codexProxyConfigured(cfg, auth))
+}
+
+func codexRetryAttemptCountForProxy(proxyEnabled bool) int {
+	attempts := 1
+	if proxyEnabled {
+		attempts += codexProxyRetryAttempts
+	}
+	return attempts
+}
+
+func codexProxyConfigured(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	if auth != nil && strings.TrimSpace(auth.ProxyURL) != "" {
+		return true
+	}
+	return cfg != nil && strings.TrimSpace(cfg.ProxyURL) != ""
+}
+
+func shouldRetryCodexTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || isTemporaryNetError(netErr)) {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.HasSuffix(lower, ": eof") || strings.Contains(lower, "unexpected eof")
+}
+
+func shouldRetryCodexCompletionError(cfg *config.Config, auth *cliproxyauth.Auth, err error) bool {
+	if !codexProxyConfigured(cfg, auth) || err == nil {
+		return false
+	}
+	if shouldRetryCodexTransportError(err) {
+		return true
+	}
+	var status statusErr
+	if errors.As(err, &status) && status.code == http.StatusRequestTimeout && strings.Contains(status.msg, "stream closed before response.completed") {
+		return true
+	}
+	return false
+}
+
+func isTemporaryNetError(err error) bool {
+	type temporary interface {
+		Temporary() bool
+	}
+	tmp, ok := err.(temporary)
+	return ok && tmp.Temporary()
+}
+
+func waitCodexProxyRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {

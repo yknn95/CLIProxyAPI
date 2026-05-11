@@ -1,11 +1,21 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -139,6 +149,115 @@ func TestNewCodexStatusErrPreservesUnclassifiedErrors(t *testing.T) {
 	}
 	if got := err.Error(); got != string(body) {
 		t.Fatalf("error body = %s, want original %s", got, string(body))
+	}
+}
+
+func TestShouldRetryCodexTransportError(t *testing.T) {
+	if !shouldRetryCodexTransportError(io.EOF) {
+		t.Fatal("expected io.EOF to be retryable")
+	}
+	if !shouldRetryCodexTransportError(io.ErrUnexpectedEOF) {
+		t.Fatal("expected io.ErrUnexpectedEOF to be retryable")
+	}
+	if !shouldRetryCodexTransportError(errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": EOF`)) {
+		t.Fatal("expected wrapped EOF text to be retryable")
+	}
+	if shouldRetryCodexTransportError(statusErr{code: http.StatusBadGateway, msg: "upstream error"}) {
+		t.Fatal("expected HTTP status error to be non-retryable here")
+	}
+}
+
+func TestCodexRetryAttemptCountForProxy(t *testing.T) {
+	if got := codexRetryAttemptCountForProxy(false); got != 1 {
+		t.Fatalf("attempts without proxy = %d, want 1", got)
+	}
+	if got := codexRetryAttemptCountForProxy(true); got != 4 {
+		t.Fatalf("attempts with proxy = %d, want 4", got)
+	}
+	if codexProxyRetryDelay != time.Second {
+		t.Fatalf("retry delay = %v, want %v", codexProxyRetryDelay, time.Second)
+	}
+}
+
+func TestDoCodexRequestWithRetryRetriesTransientProxyFailure(t *testing.T) {
+	var attempts atomic.Int32
+	resp, err := doCodexRequestWithRetry(context.Background(), true, func() (*http.Request, error) {
+		req := httptest.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+		return req, nil
+	}, func(req *http.Request) (*http.Response, error) {
+		if req == nil {
+			t.Fatal("request must not be nil")
+		}
+		if attempts.Add(1) < 4 {
+			return nil, io.EOF
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+	if got := attempts.Load(); got != 4 {
+		t.Fatalf("attempt count = %d, want 4", got)
+	}
+}
+
+func TestFinishCodexNonStreamResponseRetriesUntilCompleted(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.local:8080"}})
+	reporter := helps.NewUsageReporter(context.Background(), executor.Identifier(), "gpt-5.5", nil)
+	incomplete := "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]},\"output_index\":0}\n"
+	complete := incomplete + "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":28,\"total_tokens\":36}}}\n\n"
+
+	resp, err, retryable := executor.finishCodexNonStreamResponse(
+		context.Background(),
+		reporter,
+		&http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(incomplete))},
+		"gpt-5.5",
+		sdktranslator.FromString("openai"),
+		sdktranslator.FromString("codex"),
+		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		[]byte(`{"model":"gpt-5.5","stream":true}`),
+	)
+	if err == nil || !retryable {
+		t.Fatalf("expected retryable completion error, got err=%v retryable=%v", err, retryable)
+	}
+	if resp.Payload != nil {
+		t.Fatalf("expected empty payload on incomplete response, got %s", string(resp.Payload))
+	}
+
+	resp, err, retryable = executor.finishCodexNonStreamResponse(
+		context.Background(),
+		reporter,
+		&http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(complete))},
+		"gpt-5.5",
+		sdktranslator.FromString("openai"),
+		sdktranslator.FromString("codex"),
+		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+		[]byte(`{"model":"gpt-5.5","stream":true}`),
+	)
+	if err != nil || retryable {
+		t.Fatalf("expected success, got err=%v retryable=%v", err, retryable)
+	}
+	if len(resp.Payload) == 0 {
+		t.Fatal("expected translated payload")
+	}
+}
+
+func TestDoCodexRequestWithRetryDoesNotRetryWithoutProxy(t *testing.T) {
+	var attempts atomic.Int32
+	_, err := doCodexRequestWithRetry(context.Background(), false, func() (*http.Request, error) {
+		return httptest.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil), nil
+	}, func(req *http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		return nil, io.EOF
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempt count = %d, want 1", got)
 	}
 }
 
