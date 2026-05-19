@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -76,7 +77,7 @@ func (r *UsageReporter) PublishAdditionalModel(ctx context.Context, model string
 	if !ok {
 		return
 	}
-	usage.PublishRecord(ctx, record)
+	r.publishRecord(ctx, record)
 }
 
 func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.Detail) (usage.Record, bool) {
@@ -115,7 +116,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = normalizeUsageDetailTotal(detail)
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, failed, fail))
+		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
 
@@ -134,6 +135,8 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.OutputTokens != 0 ||
 		detail.ReasoningTokens != 0 ||
 		detail.CachedTokens != 0 ||
+		detail.CacheReadTokens != 0 ||
+		detail.CacheCreationTokens != 0 ||
 		detail.TotalTokens != 0
 }
 
@@ -146,8 +149,13 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
+		r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
 	})
+}
+
+func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
+	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
+	usage.PublishRecord(ctx, record)
 }
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures ...usage.Failure) usage.Record {
@@ -374,17 +382,7 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
-	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
-	}
-	if detail.CachedTokens == 0 {
-		// fall back to creation tokens when read tokens are absent
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
-	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
-	return detail
+	return parseClaudeUsageNode(usageNode)
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
@@ -396,16 +394,24 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
+	return parseClaudeUsageNode(usageNode), true
+}
+
+func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
+	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
+	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
 	detail := usage.Detail{
-		InputTokens:  usageNode.Get("input_tokens").Int(),
-		OutputTokens: usageNode.Get("output_tokens").Int(),
-		CachedTokens: usageNode.Get("cache_read_input_tokens").Int(),
+		InputTokens:         usageNode.Get("input_tokens").Int(),
+		OutputTokens:        usageNode.Get("output_tokens").Int(),
+		CachedTokens:        cacheReadTokens,
+		CacheReadTokens:     cacheReadTokens,
+		CacheCreationTokens: cacheCreationTokens,
 	}
 	if detail.CachedTokens == 0 {
-		detail.CachedTokens = usageNode.Get("cache_creation_input_tokens").Int()
+		detail.CachedTokens = detail.CacheCreationTokens
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
-	return detail, true
+	return detail
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {

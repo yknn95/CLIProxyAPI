@@ -412,7 +412,7 @@ func readBoundedResponsesRequestBody(c *gin.Context) ([]byte, error) {
 	}
 
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxResponsesRequestBodyBytes)
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := handlers.ReadRequestBody(c)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
