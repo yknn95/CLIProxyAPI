@@ -188,23 +188,20 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	requestFrom := codexRequestSourceFormat(opts)
 	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	requestOriginalPayload, responseOriginalPayload := codexOriginalPayloads(req, opts, requestFrom)
+	originalTranslated := sdktranslator.TranslateRequest(requestFrom, to, baseModel, requestOriginalPayload, false)
+	body := sdktranslator.TranslateRequest(requestFrom, to, baseModel, req.Payload, false)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, requestFrom.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), requestFrom.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
@@ -220,7 +217,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders := applyCodexPromptCacheHeaders(requestFrom, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -372,7 +369,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				reporter.Publish(ctx, detail)
 			}
 			var param any
-			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
+			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, responseOriginalPayload, body, payload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil
 		}
@@ -398,17 +395,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	requestFrom := codexRequestSourceFormat(opts)
 	to := sdktranslator.FromString("codex")
+	_, responseOriginalPayload := codexOriginalPayloads(req, opts, requestFrom)
 	body := req.Payload
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, requestFrom.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), requestFrom.String(), "", body, body, requestedModel, requestPath, opts.Headers)
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -420,7 +419,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
+	body, wsHeaders := applyCodexPromptCacheHeaders(requestFrom, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
@@ -627,7 +626,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, responseOriginalPayload, body, line, &param)
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"

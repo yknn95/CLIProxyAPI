@@ -8,6 +8,12 @@ import (
 
 func init() {
 	translator.Register(
+		OpenAI,
+		OpenaiResponse,
+		ConvertOpenAIChatCompletionsRequestToOpenAIResponses,
+		interfaces.TranslateResponse{},
+	)
+	translator.Register(
 		OpenaiResponse,
 		OpenAI,
 		ConvertOpenAIResponsesRequestToOpenAIChatCompletions,

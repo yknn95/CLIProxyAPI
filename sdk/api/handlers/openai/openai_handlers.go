@@ -11,13 +11,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -125,6 +128,16 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
 	}
 
+	if h.shouldRouteChatCompletionsViaResponses(rawJSON) {
+		responsesJSON := responsesconverter.ConvertOpenAIChatCompletionsRequestToOpenAIResponses(gjson.GetBytes(rawJSON, "model").String(), rawJSON, stream)
+		if stream {
+			h.handleStreamingResponseViaResponses(c, rawJSON, responsesJSON)
+		} else {
+			h.handleNonStreamingResponseViaResponses(c, rawJSON, responsesJSON)
+		}
+		return
+	}
+
 	if stream {
 		h.handleStreamingResponse(c, rawJSON)
 	} else {
@@ -144,6 +157,32 @@ func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
 	}
 	if gjson.GetBytes(rawJSON, "instructions").Exists() {
 		return true
+	}
+	return false
+}
+
+func (h *OpenAIAPIHandler) shouldRouteChatCompletionsViaResponses(rawJSON []byte) bool {
+	modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+	if modelName == "" {
+		return false
+	}
+
+	resolvedModel := modelName
+	initialSuffix := thinking.ParseSuffix(modelName)
+	if initialSuffix.ModelName == "auto" {
+		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+		if initialSuffix.HasSuffix {
+			resolvedModel = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		} else {
+			resolvedModel = resolvedBase
+		}
+	}
+
+	baseModel := strings.TrimSpace(thinking.ParseSuffix(resolvedModel).ModelName)
+	for _, provider := range util.GetProviderName(baseModel) {
+		if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			return true
+		}
 	}
 	return false
 }
@@ -447,6 +486,25 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 	cliCancel()
 }
 
+func (h *OpenAIAPIHandler) handleNonStreamingResponseViaResponses(c *gin.Context, originalRawJSON []byte, responsesJSON []byte) {
+	c.Header("Content-Type", "application/json")
+
+	modelName := gjson.GetBytes(originalRawJSON, "model").String()
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManagerRequestOverride(cliCtx, h.HandlerType(), modelName, originalRawJSON, responsesJSON, "openai-response", h.GetAlt(c))
+	stopKeepAlive()
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write(resp)
+	cliCancel()
+}
+
 // handleStreamingResponse handles streaming responses for Gemini models.
 // It establishes a streaming connection with the backend service and forwards
 // the response chunks to the client in real-time using Server-Sent Events.
@@ -518,6 +576,66 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 			// Continue streaming the rest
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			return
+		}
+	}
+}
+
+func (h *OpenAIAPIHandler) handleStreamingResponseViaResponses(c *gin.Context, originalRawJSON []byte, responsesJSON []byte) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Streaming not supported",
+				Type:    "server_error",
+			},
+		})
+		return
+	}
+
+	modelName := gjson.GetBytes(originalRawJSON, "model").String()
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerRequestOverride(cliCtx, h.HandlerType(), modelName, originalRawJSON, responsesJSON, "openai-response", h.GetAlt(c))
+
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			cliCancel(c.Request.Context().Err())
+			return
+		case errMsg, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			h.WriteErrorResponse(c, errMsg)
+			if errMsg != nil {
+				cliCancel(errMsg.Error)
+			} else {
+				cliCancel(nil)
+			}
+			return
+		case chunk, ok := <-dataChan:
+			if !ok {
+				setSSEHeaders()
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				_, _ = c.Writer.Write([]byte("\n"))
+				flusher.Flush()
+				cliCancel(nil)
+				return
+			}
+
+			setSSEHeaders()
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			_, _ = c.Writer.Write(chunk)
+			flusher.Flush()
+			h.ForwardStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, handlers.StreamForwardOptions{})
 			return
 		}
 	}

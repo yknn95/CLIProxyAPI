@@ -575,15 +575,19 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	return h.executeWithAuthManager(ctx, handlerType, modelName, rawJSON, alt, false)
+	return h.executeWithAuthManager(ctx, handlerType, modelName, rawJSON, rawJSON, alt, "", false)
 }
 
 // ExecuteImageWithAuthManager executes an OpenAI-compatible image endpoint request.
 func (h *BaseAPIHandler) ExecuteImageWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	return h.executeWithAuthManager(ctx, handlerType, modelName, rawJSON, alt, true)
+	return h.executeWithAuthManager(ctx, handlerType, modelName, rawJSON, rawJSON, alt, "", true)
 }
 
-func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, allowImageModel bool) ([]byte, http.Header, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) ExecuteWithAuthManagerRequestOverride(ctx context.Context, handlerType, modelName string, rawJSON []byte, requestPayload []byte, requestSourceFormat string, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	return h.executeWithAuthManager(ctx, handlerType, modelName, rawJSON, requestPayload, alt, requestSourceFormat, false)
+}
+
+func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, requestPayload []byte, alt string, requestSourceFormat string, allowImageModel bool) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
 	if errMsg != nil {
 		return nil, nil, errMsg
@@ -592,6 +596,9 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
+	if len(requestPayload) > 0 {
+		payload = requestPayload
+	}
 	if len(payload) == 0 {
 		payload = nil
 	}
@@ -607,6 +614,9 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
+	if requestSourceFormat = strings.TrimSpace(requestSourceFormat); requestSourceFormat != "" && requestSourceFormat != handlerType {
+		opts.Metadata[coreexecutor.RequestSourceFormatMetadataKey] = requestSourceFormat
+	}
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
@@ -683,15 +693,19 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
-	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, alt, false)
+	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, rawJSON, alt, "", false)
 }
 
 // ExecuteImageStreamWithAuthManager executes a streaming OpenAI-compatible image endpoint request.
 func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
-	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, alt, true)
+	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, rawJSON, alt, "", true)
 }
 
-func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, allowImageModel bool) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) ExecuteStreamWithAuthManagerRequestOverride(ctx context.Context, handlerType, modelName string, rawJSON []byte, requestPayload []byte, requestSourceFormat string, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, rawJSON, requestPayload, alt, requestSourceFormat, false)
+}
+
+func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, requestPayload []byte, alt string, requestSourceFormat string, allowImageModel bool) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -703,6 +717,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
+	if len(requestPayload) > 0 {
+		payload = requestPayload
+	}
 	if len(payload) == 0 {
 		payload = nil
 	}
@@ -718,6 +735,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
+	if requestSourceFormat = strings.TrimSpace(requestSourceFormat); requestSourceFormat != "" && requestSourceFormat != handlerType {
+		opts.Metadata[coreexecutor.RequestSourceFormatMetadataKey] = requestSourceFormat
+	}
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)

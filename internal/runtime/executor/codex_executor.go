@@ -166,23 +166,20 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	requestFrom := codexRequestSourceFormat(opts)
 	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	requestOriginalPayload, responseOriginalPayload := codexOriginalPayloads(req, opts, requestFrom)
+	originalTranslated := sdktranslator.TranslateRequest(requestFrom, to, baseModel, requestOriginalPayload, false)
+	body := sdktranslator.TranslateRequest(requestFrom, to, baseModel, req.Payload, false)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, requestFrom.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), requestFrom.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -196,7 +193,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.SetUsageRequestBody(ctx, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, requestFrom, url, req, body)
 	if err != nil {
 		return resp, err
 	}
@@ -221,7 +218,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	attempts := codexRetryAttemptCount(e.cfg, auth)
 	for attempt := 0; attempt < attempts; attempt++ {
 		httpResp, errRequest := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
-			httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+			httpReq, errBuild := e.cacheHelper(ctx, requestFrom, url, req, body)
 			if errBuild != nil {
 				return nil, errBuild
 			}
@@ -233,7 +230,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			return resp, errRequest
 		}
 
-		respAttempt, errAttempt, retryable := e.finishCodexNonStreamResponse(ctx, reporter, httpResp, req.Model, from, to, originalPayload, body)
+		respAttempt, errAttempt, retryable := e.finishCodexNonStreamResponse(ctx, reporter, httpResp, req.Model, from, to, responseOriginalPayload, body)
 		if errAttempt == nil {
 			return respAttempt, nil
 		}
@@ -262,23 +259,20 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	requestFrom := codexRequestSourceFormat(opts)
 	to := sdktranslator.FromString("openai-response")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	requestOriginalPayload, responseOriginalPayload := codexOriginalPayloads(req, opts, requestFrom)
+	originalTranslated := sdktranslator.TranslateRequest(requestFrom, to, baseModel, requestOriginalPayload, false)
+	body := sdktranslator.TranslateRequest(requestFrom, to, baseModel, req.Payload, false)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, requestFrom.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), requestFrom.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
@@ -288,7 +282,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	helps.SetUsageRequestBody(ctx, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, requestFrom, url, req, body)
 	if err != nil {
 		return resp, err
 	}
@@ -311,7 +305,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 	httpResp, err := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
-		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		httpReq, errBuild := e.cacheHelper(ctx, requestFrom, url, req, body)
 		if errBuild != nil {
 			return nil, errBuild
 		}
@@ -344,7 +338,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, data, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, responseOriginalPayload, body, data, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -367,23 +361,20 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	requestFrom := codexRequestSourceFormat(opts)
 	to := sdktranslator.FromString("codex")
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	requestOriginalPayload, responseOriginalPayload := codexOriginalPayloads(req, opts, requestFrom)
+	originalTranslated := sdktranslator.TranslateRequest(requestFrom, to, baseModel, requestOriginalPayload, true)
+	body := sdktranslator.TranslateRequest(requestFrom, to, baseModel, req.Payload, true)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, requestFrom.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), requestFrom.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
@@ -396,7 +387,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	helps.SetUsageRequestBody(ctx, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	httpReq, err := e.cacheHelper(ctx, requestFrom, url, req, body)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +410,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 	httpResp, err := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
-		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		httpReq, errBuild := e.cacheHelper(ctx, requestFrom, url, req, body)
 		if errBuild != nil {
 			return nil, errBuild
 		}
@@ -478,7 +469,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, responseOriginalPayload, body, translatedLine, &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -630,6 +621,39 @@ func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, report
 
 	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
 	return resp, err, shouldRetryCodexCompletionError(e.cfg, nil, err)
+}
+
+func codexRequestSourceFormat(opts cliproxyexecutor.Options) sdktranslator.Format {
+	if opts.Metadata == nil {
+		return opts.SourceFormat
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.RequestSourceFormatMetadataKey]
+	if !ok || raw == nil {
+		return opts.SourceFormat
+	}
+	switch v := raw.(type) {
+	case sdktranslator.Format:
+		if strings.TrimSpace(v.String()) != "" {
+			return v
+		}
+	case string:
+		if strings.TrimSpace(v) != "" {
+			return sdktranslator.FromString(v)
+		}
+	}
+	return opts.SourceFormat
+}
+
+func codexOriginalPayloads(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestFrom sdktranslator.Format) (requestOriginalPayload []byte, responseOriginalPayload []byte) {
+	responseOriginalPayload = req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		responseOriginalPayload = opts.OriginalRequest
+	}
+	requestOriginalPayload = req.Payload
+	if requestFrom == opts.SourceFormat && len(opts.OriginalRequest) > 0 {
+		requestOriginalPayload = opts.OriginalRequest
+	}
+	return requestOriginalPayload, responseOriginalPayload
 }
 
 func doCodexRequestWithRetry(ctx context.Context, proxyEnabled bool, buildRequest func() (*http.Request, error), do func(*http.Request) (*http.Response, error)) (*http.Response, error) {
