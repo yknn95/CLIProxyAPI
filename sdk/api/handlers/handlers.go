@@ -247,6 +247,7 @@ func attachUsageRequestMetadata(ctx context.Context, handlerType, modelName stri
 	ginCtx.Set(usageRequestModelContextKey, modelName)
 	ginCtx.Set(usageRequestFormatContextKey, handlerType)
 	if len(rawJSON) > 0 {
+		ginCtx.Set(usageRequestBodyContextKey, bytes.Clone(rawJSON))
 		ginCtx.Set(usageHasImageToolContextKey, requestHasImageGenerationTool(rawJSON))
 	}
 }

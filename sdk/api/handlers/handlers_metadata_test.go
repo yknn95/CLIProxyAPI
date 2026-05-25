@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"golang.org/x/net/context"
 )
@@ -36,5 +38,27 @@ func TestSetReasoningEffortMetadataSupportsOpenAIResponses(t *testing.T) {
 
 	if got := meta[coreexecutor.ReasoningEffortMetadataKey]; got != "medium" {
 		t.Fatalf("ReasoningEffortMetadataKey = %v, want %q", got, "medium")
+	}
+}
+
+func TestAttachUsageRequestMetadataStoresRequestBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx := &gin.Context{}
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	rawJSON := []byte(`{"model":"gpt-5.4","reasoning":{"effort":"high"}}`)
+
+	attachUsageRequestMetadata(ctx, "openai-response", "gpt-5.4", rawJSON)
+	rawJSON[0] = '['
+
+	value, exists := ginCtx.Get(usageRequestBodyContextKey)
+	if !exists {
+		t.Fatal("usage request body metadata missing")
+	}
+	got, ok := value.([]byte)
+	if !ok {
+		t.Fatalf("usage request body type = %T, want []byte", value)
+	}
+	if !bytes.Equal(got, []byte(`{"model":"gpt-5.4","reasoning":{"effort":"high"}}`)) {
+		t.Fatalf("usage request body = %s", got)
 	}
 }
