@@ -57,6 +57,9 @@ func newUpstreamRequestMetrics() *upstreamRequestMetrics {
 }
 
 func wrapUpstreamMetrics(rt http.RoundTripper) http.RoundTripper {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return rt
+	}
 	globalUpstreamMetricsOnce.Do(func() {
 		go globalUpstreamMetrics.logEvery(5 * time.Second)
 	})
@@ -157,8 +160,11 @@ func (m *upstreamRequestMetrics) logEvery(interval time.Duration) {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		if !log.IsLevelEnabled(log.DebugLevel) {
+			continue
+		}
 		snapshot := m.snapshot(true)
-		log.Info(fmt.Sprintf(
+		log.Debug(fmt.Sprintf(
 			"upstream request metrics | active=%d completed=%d errors=%d avg=%s max=%s | window: completed=%d avg=%s max=%s",
 			snapshot.ActiveRequests,
 			snapshot.CompletedTotal,
