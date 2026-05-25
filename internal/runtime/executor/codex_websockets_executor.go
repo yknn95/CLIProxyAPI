@@ -1568,6 +1568,15 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			ch := sess.activeCh
 			done := sess.activeDone
 			sess.activeMu.Unlock()
+			reason := "upstream_disconnected"
+			errDisconnect := errRead
+			if codexWebsocketTimeoutError(errRead) {
+				reason = "upstream_read_timeout"
+				if sess.pooled && ch == nil {
+					reason = "pool_idle_timeout"
+					errDisconnect = nil
+				}
+			}
 			if ch != nil {
 				select {
 				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
@@ -1577,7 +1586,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				sess.clearActive(ch)
 				close(ch)
 			}
-			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+			e.invalidateUpstreamConn(sess, conn, reason, errDisconnect)
 			return
 		}
 
@@ -1615,6 +1624,11 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		case <-done:
 		}
 	}
+}
+
+func codexWebsocketTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
