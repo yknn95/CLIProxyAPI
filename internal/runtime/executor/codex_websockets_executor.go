@@ -402,6 +402,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream request sent session=%q", executionSessionID)
 
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -441,10 +443,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
 		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event type=%q bytes=%d payload=%s", eventType, len(payload), truncateCodexDebugPayload(payload, 512))
+		if eventType == "response.output_item.done" {
+			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
+			continue
+		}
 		if eventType == "response.completed" {
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
+			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
@@ -688,6 +695,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 
 		var param any
+		outputItemsByIndex := make(map[int64][]byte)
+		var outputItemsFallback [][]byte
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -748,10 +757,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
 			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event type=%q bytes=%d payload=%s", eventType, len(payload), truncateCodexDebugPayload(payload, 512))
-			if eventType == "response.completed" || eventType == "response.done" {
+			switch eventType {
+			case "response.output_item.done":
+				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
+			case "response.completed", "response.done":
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
 				}
+				payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
