@@ -34,3 +34,44 @@ codex-header-defaults:
 		t.Fatalf("BetaFeatures = %q, want %q", got, "feature-a,feature-b")
 	}
 }
+
+func TestLoadConfigOptional_CodexWebsocketPool(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+codex-websocket-pool:
+  enabled: true
+  max-active-per-auth: 30
+  max-idle-per-auth: 4
+  idle-timeout: "5m"
+  max-request-bytes: 33554432
+  fallback-http: false
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+
+	if !cfg.CodexWebsocketPool.Enabled {
+		t.Fatal("CodexWebsocketPool.Enabled = false, want true")
+	}
+	if got := cfg.CodexWebsocketPool.MaxActivePerAuth; got != 30 {
+		t.Fatalf("MaxActivePerAuth = %d, want 30", got)
+	}
+	if got := cfg.CodexWebsocketPool.MaxIdlePerAuth; got != 4 {
+		t.Fatalf("MaxIdlePerAuth = %d, want 4", got)
+	}
+	if got := cfg.CodexWebsocketPool.IdleTimeout; got != "5m" {
+		t.Fatalf("IdleTimeout = %q, want 5m", got)
+	}
+	if got := cfg.CodexWebsocketPool.MaxRequestBytes; got != 33554432 {
+		t.Fatalf("MaxRequestBytes = %d, want 33554432", got)
+	}
+	if cfg.CodexWebsocketPool.FallbackHTTP == nil || *cfg.CodexWebsocketPool.FallbackHTTP {
+		t.Fatalf("FallbackHTTP = %#v, want false", cfg.CodexWebsocketPool.FallbackHTTP)
+	}
+}

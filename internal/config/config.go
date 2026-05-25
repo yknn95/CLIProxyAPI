@@ -115,6 +115,11 @@ type Config struct {
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
+	// CodexWebsocketPool enables pooled upstream Codex websocket connections for
+	// stateless OAuth/file-backed HTTP responses requests. API-key auth must
+	// explicitly enable websockets.
+	CodexWebsocketPool CodexWebsocketPoolConfig `yaml:"codex-websocket-pool" json:"codex-websocket-pool"`
+
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
 
@@ -171,6 +176,16 @@ type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	Originator   string `yaml:"originator" json:"originator"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// CodexWebsocketPoolConfig controls pooled upstream Codex websocket reuse.
+type CodexWebsocketPoolConfig struct {
+	Enabled          bool   `yaml:"enabled" json:"enabled"`
+	MaxActivePerAuth int    `yaml:"max-active-per-auth" json:"max-active-per-auth"`
+	MaxIdlePerAuth   int    `yaml:"max-idle-per-auth" json:"max-idle-per-auth"`
+	IdleTimeout      string `yaml:"idle-timeout" json:"idle-timeout"`
+	MaxRequestBytes  int    `yaml:"max-request-bytes" json:"max-request-bytes"`
+	FallbackHTTP     *bool  `yaml:"fallback-http,omitempty" json:"fallback-http,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.

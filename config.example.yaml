@@ -241,6 +241,17 @@ nonstream-keepalive-interval: 0
 #   originator: "codex_cli_rs"
 #   beta-features: "multi_agent"
 
+# Optional upstream Codex websocket pool for stateless HTTP /v1/responses requests.
+# OAuth/file-backed Codex auth can use this directly; codex-api-key entries must
+# set websockets: true. Each websocket runs one request at a time.
+# codex-websocket-pool:
+#   enabled: false
+#   max-active-per-auth: 30
+#   max-idle-per-auth: 4
+#   idle-timeout: "5m"
+#   max-request-bytes: 33554432 # larger requests fall back to HTTP; set -1 to disable this guard
+#   fallback-http: true
+
 # OpenAI compatibility providers
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.

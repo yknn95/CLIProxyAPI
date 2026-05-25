@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +91,93 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
+func TestCodexAutoExecutorUsesPooledWebsocketForStatelessHTTP(t *testing.T) {
+	var upgrades atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrades.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			msgType, _, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			if msgType != websocket.TextMessage {
+				t.Errorf("message type = %d, want text", msgType)
+				return
+			}
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-2","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+		CodexWebsocketPool: config.CodexWebsocketPoolConfig{
+			Enabled:          true,
+			MaxActivePerAuth: 30,
+			MaxIdlePerAuth:   4,
+			IdleTimeout:      "5m",
+		},
+	}
+	exec := NewCodexAutoExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		ID: "auth-1",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":"hello"}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+
+	if got := upgrades.Load(); got != 1 {
+		t.Fatalf("websocket upgrades = %d, want 1", got)
+	}
+}
+
+func TestCodexWebsocketTransportEnabledAllowsOAuthWhenPoolEnabled(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "codex"}
+
+	if !codexWebsocketTransportEnabled(auth, true) {
+		t.Fatal("expected OAuth/file-backed auth to use websocket transport when pool is enabled")
+	}
+	if codexWebsocketTransportEnabled(auth, false) {
+		t.Fatal("expected OAuth/file-backed auth to stay on HTTP when pool is disabled")
+	}
+}
+
+func TestCodexWebsocketTransportEnabledRequiresAPIKeyOptIn(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+
+	if codexWebsocketTransportEnabled(auth, true) {
+		t.Fatal("expected API-key auth without websockets opt-in to stay on HTTP")
+	}
+	auth.Attributes["websockets"] = "true"
+	if !codexWebsocketTransportEnabled(auth, true) {
+		t.Fatal("expected API-key auth with websockets opt-in to use websocket transport")
 	}
 }
 
@@ -288,6 +376,7 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}

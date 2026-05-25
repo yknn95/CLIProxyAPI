@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,7 +38,10 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
+	codexWebsocketPoolDefaultMaxRequest    = 32 << 20
 )
+
+var errCodexWebsocketRequestTooLarge = errors.New("codex websocket request too large for pooled transport")
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
 //
@@ -47,6 +51,7 @@ type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
 	store *codexWebsocketSessionStore
+	pools *codexWebsocketPoolStore
 }
 
 type codexWebsocketSessionStore struct {
@@ -56,6 +61,32 @@ type codexWebsocketSessionStore struct {
 
 var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 	sessions: make(map[string]*codexWebsocketSession),
+}
+
+type codexWebsocketPoolStore struct {
+	mu    sync.Mutex
+	pools map[string]*codexWebsocketPool
+}
+
+type codexWebsocketPool struct {
+	key         string
+	maxActive   int
+	maxIdle     int
+	idleTimeout time.Duration
+
+	mu     sync.Mutex
+	active int
+	idle   []*codexWebsocketSession
+	closed bool
+}
+
+type codexWebsocketLease struct {
+	pool *codexWebsocketPool
+	sess *codexWebsocketSession
+}
+
+var globalCodexWebsocketPoolStore = &codexWebsocketPoolStore{
+	pools: make(map[string]*codexWebsocketPool),
 }
 
 type codexWebsocketSession struct {
@@ -79,12 +110,16 @@ type codexWebsocketSession struct {
 
 	upstreamDisconnectOnce sync.Once
 	upstreamDisconnectCh   chan error
+
+	pooled   bool
+	lastUsed time.Time
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	return &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
 		store:         globalCodexWebsocketSessionStore,
+		pools:         globalCodexWebsocketPoolStore,
 	}
 }
 
@@ -232,13 +267,35 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
+	var lease *codexWebsocketLease
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		sess.reqMu.Lock()
 		defer sess.reqMu.Unlock()
+	} else if !cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketPoolEnabled(e.cfg) {
+		lease, err = e.acquirePooledSession(auth, wsURL)
+		if err != nil {
+			return resp, err
+		}
+		if lease != nil {
+			sess = lease.sess
+			defer func() {
+				keep := err == nil
+				reason := "pool_returned"
+				if !keep {
+					reason = "pool_request_error"
+				}
+				lease.release(keep, reason)
+			}()
+		}
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	if lease != nil && codexWebsocketRequestTooLarge(e.cfg, len(wsReqBody)) {
+		err = fmt.Errorf("%w: bytes=%d limit=%d", errCodexWebsocketRequestTooLarge, len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		helps.LogWithRequestID(ctx).Warnf("codex websocket executor: pooled non-stream request too large, falling back to HTTP bytes=%d limit=%d", len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		return resp, err
+	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -285,6 +342,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, reason, err)
 			if errClose := conn.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close websocket error: %v", errClose)
+			}
+		}()
+	} else if lease != nil {
+		defer func() {
+			if err != nil {
+				e.invalidateUpstreamConn(sess, conn, "pooled_request_error", err)
 			}
 		}()
 	}
@@ -441,14 +504,29 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
+	var lease *codexWebsocketLease
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
 			sess.reqMu.Lock()
 		}
+	} else if !cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketPoolEnabled(e.cfg) {
+		lease, err = e.acquirePooledSession(auth, wsURL)
+		if err != nil {
+			return nil, err
+		}
+		if lease != nil {
+			sess = lease.sess
+		}
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	if lease != nil && codexWebsocketRequestTooLarge(e.cfg, len(wsReqBody)) {
+		lease.release(false, "pool_request_too_large")
+		errTooLarge := fmt.Errorf("%w: bytes=%d limit=%d", errCodexWebsocketRequestTooLarge, len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		helps.LogWithRequestID(ctx).Warnf("codex websocket executor: pooled stream request too large, falling back to HTTP bytes=%d limit=%d", len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		return nil, errTooLarge
+	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -482,7 +560,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
-			sess.reqMu.Unlock()
+			if lease != nil {
+				lease.release(false, "pool_dial_error")
+			} else {
+				sess.reqMu.Unlock()
+			}
 		}
 		return nil, errDial
 	}
@@ -515,7 +597,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(readCh)
-				sess.reqMu.Unlock()
+				if lease != nil {
+					lease.release(false, "pool_dial_retry_error")
+				} else {
+					sess.reqMu.Unlock()
+				}
 				return nil, errDialRetry
 			}
 			wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
@@ -535,7 +621,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(readCh)
-				sess.reqMu.Unlock()
+				if lease != nil {
+					lease.release(false, "pool_send_retry_error")
+				} else {
+					sess.reqMu.Unlock()
+				}
 				return nil, errSendRetry
 			}
 			conn = connRetry
@@ -559,7 +649,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		defer func() {
 			if sess != nil {
 				sess.clearActive(readCh)
-				sess.reqMu.Unlock()
+				if lease != nil {
+					keep := terminateErr == nil
+					reason := "pool_returned"
+					if !keep {
+						e.invalidateUpstreamConn(sess, conn, terminateReason, terminateErr)
+						reason = terminateReason
+					}
+					lease.release(keep, reason)
+				} else {
+					sess.reqMu.Unlock()
+				}
 				return
 			}
 			logCodexWebsocketDisconnected(executionSessionID, authID, wsURL, terminateReason, terminateErr)
@@ -1272,6 +1372,130 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	return sess
 }
 
+func (e *CodexWebsocketsExecutor) acquirePooledSession(auth *cliproxyauth.Auth, wsURL string) (*codexWebsocketLease, error) {
+	enabled, maxActive, maxIdle, idleTimeout := codexWebsocketPoolSettings(e.cfg)
+	if !enabled {
+		return nil, nil
+	}
+	key := codexWebsocketPoolKey(auth, wsURL)
+	if key == "" {
+		return nil, nil
+	}
+	store := e.pools
+	if store == nil {
+		store = globalCodexWebsocketPoolStore
+	}
+	store.mu.Lock()
+	if store.pools == nil {
+		store.pools = make(map[string]*codexWebsocketPool)
+	}
+	pool := store.pools[key]
+	if pool != nil {
+		pool.mu.Lock()
+		closed := pool.closed
+		pool.mu.Unlock()
+		if closed {
+			delete(store.pools, key)
+			pool = nil
+		}
+	}
+	if pool == nil {
+		pool = &codexWebsocketPool{
+			key:         key,
+			maxActive:   maxActive,
+			maxIdle:     maxIdle,
+			idleTimeout: idleTimeout,
+		}
+		store.pools[key] = pool
+	}
+	store.mu.Unlock()
+	return pool.acquire(maxActive, maxIdle, idleTimeout)
+}
+
+func (p *codexWebsocketPool) acquire(maxActive int, maxIdle int, idleTimeout time.Duration) (*codexWebsocketLease, error) {
+	if p == nil {
+		return nil, nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("codex websocket pool is closed")
+	}
+	p.maxActive = maxActive
+	p.maxIdle = maxIdle
+	p.idleTimeout = idleTimeout
+
+	now := time.Now()
+	for len(p.idle) > 0 {
+		idx := len(p.idle) - 1
+		sess := p.idle[idx]
+		p.idle = p.idle[:idx]
+		if sess == nil || !codexWebsocketSessionReusable(sess, now, p.idleTimeout) {
+			go closeCodexWebsocketSession(sess, "pool_idle_expired")
+			continue
+		}
+		p.active++
+		log.Infof("codex websocket pool: acquired idle key=%s active=%d idle=%d max_active=%d max_idle=%d", p.key, p.active, len(p.idle), p.maxActive, p.maxIdle)
+		sess.reqMu.Lock()
+		return &codexWebsocketLease{pool: p, sess: sess}, nil
+	}
+
+	if p.active >= p.maxActive {
+		log.Warnf("codex websocket pool: exhausted key=%s active=%d idle=%d max_active=%d max_idle=%d", p.key, p.active, len(p.idle), p.maxActive, p.maxIdle)
+		return nil, fmt.Errorf("codex websocket pool exhausted: active=%d max=%d", p.active, p.maxActive)
+	}
+	p.active++
+	log.Infof("codex websocket pool: creating session key=%s active=%d idle=%d max_active=%d max_idle=%d", p.key, p.active, len(p.idle), p.maxActive, p.maxIdle)
+	sess := &codexWebsocketSession{
+		sessionID:            fmt.Sprintf("pool:%s:%d", p.key, time.Now().UnixNano()),
+		upstreamDisconnectCh: make(chan error, 1),
+		pooled:               true,
+	}
+	sess.reqMu.Lock()
+	return &codexWebsocketLease{pool: p, sess: sess}, nil
+}
+
+func (l *codexWebsocketLease) release(keep bool, reason string) {
+	if l == nil || l.pool == nil || l.sess == nil {
+		return
+	}
+	pool := l.pool
+	sess := l.sess
+	sess.reqMu.Unlock()
+
+	var closeSess *codexWebsocketSession
+	pool.mu.Lock()
+	if pool.active > 0 {
+		pool.active--
+	}
+	if keep && !pool.closed && codexWebsocketSessionReusable(sess, time.Now(), 0) && len(pool.idle) < pool.maxIdle {
+		sess.lastUsed = time.Now()
+		pool.idle = append(pool.idle, sess)
+		log.Infof("codex websocket pool: released idle key=%s active=%d idle=%d max_active=%d max_idle=%d", pool.key, pool.active, len(pool.idle), pool.maxActive, pool.maxIdle)
+	} else {
+		closeSess = sess
+		log.Infof("codex websocket pool: released close key=%s active=%d idle=%d max_active=%d max_idle=%d reason=%s keep=%t", pool.key, pool.active, len(pool.idle), pool.maxActive, pool.maxIdle, reason, keep)
+	}
+	pool.mu.Unlock()
+
+	if closeSess != nil {
+		closeCodexWebsocketSession(closeSess, reason)
+	}
+}
+
+func codexWebsocketSessionReusable(sess *codexWebsocketSession, now time.Time, idleTimeout time.Duration) bool {
+	if sess == nil {
+		return false
+	}
+	if idleTimeout > 0 && !sess.lastUsed.IsZero() && now.Sub(sess.lastUsed) > idleTimeout {
+		return false
+	}
+	sess.connMu.Lock()
+	conn := sess.conn
+	sess.connMu.Unlock()
+	return conn != nil
+}
+
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
 	sess := e.getOrCreateSession(sessionID)
 	if sess == nil {
@@ -1552,10 +1776,6 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 			matches = append(matches, items[i])
 		}
 	}
-	if len(matches) == 0 {
-		return
-	}
-
 	toClose := make([]*codexWebsocketSession, 0, len(matches))
 	store.mu.Lock()
 	for i := range matches {
@@ -1571,13 +1791,50 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	for i := range toClose {
 		closeCodexWebsocketSession(toClose[i], reason)
 	}
+	closeCodexWebsocketPoolsForAuthID(authID, reason)
 }
 
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
-//
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+func closeCodexWebsocketPoolsForAuthID(authID string, reason string) {
+	poolStore := globalCodexWebsocketPoolStore
+	if poolStore == nil {
+		return
+	}
+	prefix := authID + "|"
+	var pools []*codexWebsocketPool
+	poolStore.mu.Lock()
+	for key, pool := range poolStore.pools {
+		if !strings.HasPrefix(key, prefix) || pool == nil {
+			continue
+		}
+		delete(poolStore.pools, key)
+		pools = append(pools, pool)
+	}
+	poolStore.mu.Unlock()
+
+	for _, pool := range pools {
+		pool.close(reason)
+	}
+}
+
+func (p *codexWebsocketPool) close(reason string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.closed = true
+	idle := p.idle
+	p.idle = nil
+	p.mu.Unlock()
+
+	for _, sess := range idle {
+		closeCodexWebsocketSession(sess, reason)
+	}
+}
+
+// CodexAutoExecutor routes Codex requests to the websocket transport when the
+// downstream transport is websocket, or when the upstream websocket pool is
+// enabled for stateless OAuth/file-backed HTTP requests. API-key auth must
+// explicitly enable websockets.
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
@@ -1610,8 +1867,17 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.Execute(ctx, auth, req, opts)
+	downstreamWS := cliproxyexecutor.DownstreamWebsocket(ctx)
+	poolEnabled := codexWebsocketPoolEnabled(e.wsExec.cfg)
+	wsEnabled := codexWebsocketTransportEnabled(auth, poolEnabled)
+	if wsEnabled && (downstreamWS || poolEnabled) {
+		resp, err := e.wsExec.Execute(ctx, auth, req, opts)
+		if err == nil || downstreamWS || !codexWebsocketPoolFallbackHTTP(e.wsExec.cfg) {
+			return resp, err
+		}
+		helps.LogWithRequestID(ctx).Warnf("codex auto executor: websocket request failed, falling back to HTTP: %v", err)
+	} else {
+		helps.LogWithRequestID(ctx).Debugf("codex auto executor: using HTTP transport websocket_enabled=%t downstream_websocket=%t websocket_pool_enabled=%t", wsEnabled, downstreamWS, poolEnabled)
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
 }
@@ -1620,8 +1886,17 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
+	downstreamWS := cliproxyexecutor.DownstreamWebsocket(ctx)
+	poolEnabled := codexWebsocketPoolEnabled(e.wsExec.cfg)
+	wsEnabled := codexWebsocketTransportEnabled(auth, poolEnabled)
+	if wsEnabled && (downstreamWS || poolEnabled) {
+		resp, err := e.wsExec.ExecuteStream(ctx, auth, req, opts)
+		if err == nil || downstreamWS || !codexWebsocketPoolFallbackHTTP(e.wsExec.cfg) {
+			return resp, err
+		}
+		helps.LogWithRequestID(ctx).Warnf("codex auto executor: websocket stream request failed, falling back to HTTP: %v", err)
+	} else {
+		helps.LogWithRequestID(ctx).Debugf("codex auto executor: using HTTP stream transport websocket_enabled=%t downstream_websocket=%t websocket_pool_enabled=%t", wsEnabled, downstreamWS, poolEnabled)
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 }
@@ -1684,4 +1959,86 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	default:
 	}
 	return false
+}
+
+func codexWebsocketTransportEnabled(auth *cliproxyauth.Auth, poolEnabled bool) bool {
+	if codexWebsocketsEnabled(auth) {
+		return true
+	}
+	return poolEnabled && auth != nil && !codexAuthUsesAPIKey(auth)
+}
+
+func codexWebsocketPoolEnabled(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.CodexWebsocketPool.Enabled
+}
+
+func codexWebsocketPoolFallbackHTTP(cfg *config.Config) bool {
+	if cfg == nil || cfg.CodexWebsocketPool.FallbackHTTP == nil {
+		return true
+	}
+	return *cfg.CodexWebsocketPool.FallbackHTTP
+}
+
+func codexWebsocketPoolSettings(cfg *config.Config) (bool, int, int, time.Duration) {
+	if cfg == nil || !cfg.CodexWebsocketPool.Enabled {
+		return false, 0, 0, 0
+	}
+	maxActive := cfg.CodexWebsocketPool.MaxActivePerAuth
+	if maxActive <= 0 {
+		maxActive = 30
+	}
+	maxIdle := cfg.CodexWebsocketPool.MaxIdlePerAuth
+	if maxIdle < 0 {
+		maxIdle = 0
+	}
+	if maxIdle == 0 {
+		maxIdle = 4
+	}
+	if maxIdle > maxActive {
+		maxIdle = maxActive
+	}
+	idleTimeout := 5 * time.Minute
+	if raw := strings.TrimSpace(cfg.CodexWebsocketPool.IdleTimeout); raw != "" {
+		if parsed, errParse := time.ParseDuration(raw); errParse == nil && parsed > 0 {
+			idleTimeout = parsed
+		}
+	}
+	return true, maxActive, maxIdle, idleTimeout
+}
+
+func codexWebsocketPoolMaxRequestBytes(cfg *config.Config) int {
+	if cfg == nil {
+		return codexWebsocketPoolDefaultMaxRequest
+	}
+	if cfg.CodexWebsocketPool.MaxRequestBytes < 0 {
+		return -1
+	}
+	if cfg.CodexWebsocketPool.MaxRequestBytes == 0 {
+		return codexWebsocketPoolDefaultMaxRequest
+	}
+	return cfg.CodexWebsocketPool.MaxRequestBytes
+}
+
+func codexWebsocketRequestTooLarge(cfg *config.Config, size int) bool {
+	limit := codexWebsocketPoolMaxRequestBytes(cfg)
+	return limit >= 0 && size > limit
+}
+
+func codexWebsocketPoolKey(auth *cliproxyauth.Auth, wsURL string) string {
+	wsURL = strings.TrimSpace(wsURL)
+	if wsURL == "" {
+		return ""
+	}
+	authID := "anonymous"
+	if auth != nil {
+		if strings.TrimSpace(auth.ID) != "" {
+			authID = strings.TrimSpace(auth.ID)
+		} else if strings.TrimSpace(auth.Label) != "" {
+			authID = strings.TrimSpace(auth.Label)
+		}
+	}
+	return authID + "|" + wsURL
 }
