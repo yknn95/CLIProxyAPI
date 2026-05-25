@@ -44,7 +44,7 @@ codex-websocket-pool:
   max-active-per-auth: 30
   max-idle-per-auth: 4
   idle-timeout: "5m"
-  max-request-bytes: 33554432
+  max-request-bytes: 16777216
   fallback-http: false
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
@@ -68,8 +68,8 @@ codex-websocket-pool:
 	if got := cfg.CodexWebsocketPool.IdleTimeout; got != "5m" {
 		t.Fatalf("IdleTimeout = %q, want 5m", got)
 	}
-	if got := cfg.CodexWebsocketPool.MaxRequestBytes; got != 33554432 {
-		t.Fatalf("MaxRequestBytes = %d, want 33554432", got)
+	if got := cfg.CodexWebsocketPool.MaxRequestBytes; got != 16777216 {
+		t.Fatalf("MaxRequestBytes = %d, want 16777216", got)
 	}
 	if cfg.CodexWebsocketPool.FallbackHTTP == nil || *cfg.CodexWebsocketPool.FallbackHTTP {
 		t.Fatalf("FallbackHTTP = %#v, want false", cfg.CodexWebsocketPool.FallbackHTTP)

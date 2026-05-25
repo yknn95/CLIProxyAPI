@@ -249,7 +249,7 @@ nonstream-keepalive-interval: 0
 #   max-active-per-auth: 30
 #   max-idle-per-auth: 4
 #   idle-timeout: "5m"
-#   max-request-bytes: 33554432 # larger requests fall back to HTTP; set -1 to disable this guard
+#   max-request-bytes: 16777216 # larger requests fall back to HTTP; set -1 to disable this guard
 #   fallback-http: true
 
 # OpenAI compatibility providers

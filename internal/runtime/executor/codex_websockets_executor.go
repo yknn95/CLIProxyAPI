@@ -38,7 +38,7 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
-	codexWebsocketPoolDefaultMaxRequest    = 32 << 20
+	codexWebsocketPoolDefaultMaxRequest    = 16 << 20
 )
 
 var errCodexWebsocketRequestTooLarge = errors.New("codex websocket request too large for pooled transport")
