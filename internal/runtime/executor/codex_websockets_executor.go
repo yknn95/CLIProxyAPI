@@ -252,8 +252,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
+	helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream request prepared model=%s url=%s body_bytes=%d session=%q", baseModel, wsURL, len(wsReqBody), executionSessionID)
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	if errDial != nil {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream dial error session=%q err=%v", executionSessionID, errDial)
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
@@ -266,6 +268,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
+	}
+	if respHS != nil {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream dial ok session=%q status=%d request_id=%q", executionSessionID, respHS.StatusCode, respHS.Header.Get("x-request-id"))
+	} else {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream dial ok session=%q", executionSessionID)
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	if sess == nil {
@@ -290,6 +297,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream send error session=%q err=%v", executionSessionID, errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 
@@ -329,6 +337,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, errSend
 		}
 	}
+	helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream request sent session=%q", executionSessionID)
 
 	for {
 		if ctx != nil && ctx.Err() != nil {
@@ -358,6 +367,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
+			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event error session=%q payload=%s", executionSessionID, truncateCodexDebugPayload(payload, 512))
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 			}
@@ -367,6 +377,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event type=%q bytes=%d payload=%s", eventType, len(payload), truncateCodexDebugPayload(payload, 512))
 		if eventType == "response.completed" {
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
@@ -451,12 +462,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
+	helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream request prepared model=%s url=%s body_bytes=%d session=%q", baseModel, wsURL, len(wsReqBody), executionSessionID)
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
 	}
 	if errDial != nil {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream dial error session=%q err=%v", executionSessionID, errDial)
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
@@ -473,6 +486,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 		return nil, errDial
 	}
+	if respHS != nil {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream dial ok session=%q status=%d request_id=%q", executionSessionID, respHS.StatusCode, respHS.Header.Get("x-request-id"))
+	} else {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream dial ok session=%q", executionSessionID)
+	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 
 	if sess == nil {
@@ -486,6 +504,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream send error session=%q err=%v", executionSessionID, errSend)
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
@@ -529,6 +548,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return nil, errSend
 		}
 	}
+	helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream request sent session=%q", executionSessionID)
 
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -607,6 +627,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
+				helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event error session=%q payload=%s", executionSessionID, truncateCodexDebugPayload(payload, 512))
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
@@ -620,6 +641,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
+			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event type=%q bytes=%d payload=%s", eventType, len(payload), truncateCodexDebugPayload(payload, 512))
 			if eventType == "response.completed" || eventType == "response.done" {
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
@@ -853,7 +875,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 
 	isAPIKey := codexAuthUsesAPIKey(auth)
-	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgOriginator, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
@@ -880,6 +902,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	ensureHeaderCasePreserved(headers, ginHeaders, "session_id", "", "")
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
+	} else if cfgOriginator != "" {
+		headers.Set("Originator", cfgOriginator)
 	} else if !isAPIKey {
 		headers.Set("Originator", codexOriginator)
 	}
@@ -973,16 +997,16 @@ func deleteHeaderCaseInsensitive(headers http.Header, key string) {
 	}
 }
 
-func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string) {
+func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string, string) {
 	if cfg == nil || auth == nil {
-		return "", ""
+		return "", "", ""
 	}
 	if auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			return "", ""
+			return "", "", ""
 		}
 	}
-	return strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent), strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	return strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent), strings.TrimSpace(cfg.CodexHeaderDefaults.Originator), strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 
 func ensureHeaderWithPriority(target http.Header, source http.Header, key, configValue, fallbackValue string) {

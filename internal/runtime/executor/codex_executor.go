@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sort"
 	"strings"
 	"syscall"
@@ -315,6 +317,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream request prepared model=%s url=%s body_bytes=%d proxy=%t", baseModel, url, len(body), codexProxyConfigured(e.cfg, auth))
 	attempts := codexRetryAttemptCount(e.cfg, auth)
 	for attempt := 0; attempt < attempts; attempt++ {
 		httpResp, errRequest := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
@@ -407,6 +410,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	helps.LogWithRequestID(ctx).Debugf("codex executor: upstream stream request prepared model=%s url=%s body_bytes=%d proxy=%t", baseModel, url, len(body), codexProxyConfigured(e.cfg, auth))
 	httpResp, err := e.doCodexRequest(ctx, auth, func() (*http.Request, error) {
 		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
 		if errBuild != nil {
@@ -555,6 +559,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		helps.LogWithRequestID(ctx).Debug("codex executor: upstream stream SSE scan started")
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -562,6 +567,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				eventType := gjson.GetBytes(data, "type").String()
+				helps.LogWithRequestID(ctx).Debugf("codex executor: upstream stream SSE event type=%q bytes=%d payload=%s", eventType, len(data), truncateCodexDebugPayload(data, 512))
 				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
@@ -571,7 +578,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
-				switch gjson.GetBytes(data, "type").String() {
+				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
@@ -595,12 +602,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			helps.LogWithRequestID(ctx).Debugf("codex executor: upstream stream SSE scan error: %v", errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
+			return
 		}
+		helps.LogWithRequestID(ctx).Debug("codex executor: upstream stream SSE scan ended")
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -642,8 +652,26 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 
 func (e *CodexExecutor) doCodexRequest(ctx context.Context, auth *cliproxyauth.Auth, buildRequest func() (*http.Request, error)) (*http.Response, error) {
 	return doCodexRequestWithRetry(ctx, codexProxyConfigured(e.cfg, auth), buildRequest, func(req *http.Request) (*http.Response, error) {
-		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient := e.newCodexHTTPClient(ctx, auth)
 		return httpClient.Do(req)
+	})
+}
+
+func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth) *http.Client {
+	if !codexProxyConfigured(e.cfg, auth) {
+		return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	}
+
+	return helps.NewProxyAwareHTTPClientWithTransportCustomizer(ctx, e.cfg, auth, 0, func(transport *http.Transport) {
+		transport.ForceAttemptHTTP2 = false
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		} else {
+			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		}
+		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+		helps.LogWithRequestID(ctx).Debug("codex executor: forced HTTP/1.1 for proxied HTTP request")
 	})
 }
 
@@ -652,6 +680,7 @@ func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, report
 	if httpResp == nil {
 		return resp, errors.New("codex executor: nil http response"), false
 	}
+	helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream response headers status=%d content_type=%q request_id=%q", httpResp.StatusCode, httpResp.Header.Get("Content-Type"), httpResp.Header.Get("x-request-id"))
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -664,23 +693,24 @@ func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, report
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		return resp, newCodexStatusErr(httpResp.StatusCode, b), false
 	}
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err, shouldRetryCodexCompletionError(e.cfg, nil, err)
-	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-
-	lines := bytes.Split(data, []byte("\n"))
+	scanner := bufio.NewScanner(httpResp.Body)
+	scanner.Buffer(nil, 52_428_800) // 50MB
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
-	for _, line := range lines {
+	helps.LogWithRequestID(ctx).Debug("codex executor: upstream non-stream SSE scan started")
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 		if !bytes.HasPrefix(line, dataTag) {
+			if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+				helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE non-data line bytes=%d payload=%s", len(trimmed), truncateCodexDebugPayload(trimmed, 512))
+			}
 			continue
 		}
 
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
+		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE event type=%q bytes=%d payload=%s", eventType, len(eventData), truncateCodexDebugPayload(eventData, 512))
 
 		if streamErr, ok := codexTerminalStreamContextLengthErr(eventData); ok {
 			return resp, streamErr, false
@@ -701,15 +731,22 @@ func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, report
 		publishCodexImageToolUsage(ctx, reporter, body, eventData)
 
 		completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE completed output_items_indexed=%d output_items_fallback=%d", len(outputItemsByIndex), len(outputItemsFallback))
 
 		var param any
 		out := sdktranslator.TranslateNonStream(ctx, to, from, requestModel, originalPayload, body, completedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil, false
 	}
+	if errScan := scanner.Err(); errScan != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE scan error: %v", errScan)
+		return resp, errScan, shouldRetryCodexCompletionError(e.cfg, nil, errScan)
+	}
 
-	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
-	return resp, err, shouldRetryCodexCompletionError(e.cfg, nil, err)
+	errCompletion := statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	helps.LogWithRequestID(ctx).Debug("codex executor: upstream non-stream SSE scan ended before response.completed")
+	return resp, errCompletion, shouldRetryCodexCompletionError(e.cfg, nil, errCompletion)
 }
 
 func doCodexRequestWithRetry(ctx context.Context, proxyEnabled bool, buildRequest func() (*http.Request, error), do func(*http.Request) (*http.Response, error)) (*http.Response, error) {
@@ -721,11 +758,31 @@ func doCodexRequestWithRetry(ctx context.Context, proxyEnabled bool, buildReques
 		if err != nil {
 			return nil, err
 		}
+		requestURL := ""
+		requestMethod := ""
+		if req != nil {
+			requestMethod = req.Method
+			if req.URL != nil {
+				requestURL = req.URL.String()
+			}
+			req = req.WithContext(httptrace.WithClientTrace(req.Context(), codexHTTPTrace(ctx, attempt+1, attempts)))
+		}
+		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream request attempt start attempt=%d/%d method=%s url=%s proxy=%t", attempt+1, attempts, requestMethod, requestURL, proxyEnabled)
 		resp, err := do(req)
 		if err == nil {
+			statusCode := 0
+			contentType := ""
+			requestID := ""
+			if resp != nil {
+				statusCode = resp.StatusCode
+				contentType = resp.Header.Get("Content-Type")
+				requestID = resp.Header.Get("x-request-id")
+			}
+			helps.LogWithRequestID(ctx).Debugf("codex executor: upstream request attempt response attempt=%d/%d status=%d content_type=%q request_id=%q", attempt+1, attempts, statusCode, contentType, requestID)
 			return resp, nil
 		}
 		lastErr = err
+		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream request attempt error attempt=%d/%d err=%v", attempt+1, attempts, err)
 		if !proxyEnabled || attempt >= attempts-1 || !shouldRetryCodexTransportError(err) {
 			return nil, err
 		}
@@ -735,6 +792,65 @@ func doCodexRequestWithRetry(ctx context.Context, proxyEnabled bool, buildReques
 		}
 	}
 	return nil, lastErr
+}
+
+func codexHTTPTrace(ctx context.Context, attempt int, attempts int) *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace get_conn attempt=%d/%d host=%s", attempt, attempts, hostPort)
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace got_conn attempt=%d/%d reused=%t was_idle=%t idle_time=%s", attempt, attempts, info.Reused, info.WasIdle, info.IdleTime)
+		},
+		PutIdleConn: func(err error) {
+			if err != nil {
+				helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace put_idle_conn attempt=%d/%d err=%v", attempt, attempts, err)
+				return
+			}
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace put_idle_conn attempt=%d/%d", attempt, attempts)
+		},
+		ConnectStart: func(network string, addr string) {
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace connect_start attempt=%d/%d network=%s addr=%s", attempt, attempts, network, addr)
+		},
+		ConnectDone: func(network string, addr string, err error) {
+			if err != nil {
+				helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace connect_done attempt=%d/%d network=%s addr=%s err=%v", attempt, attempts, network, addr, err)
+				return
+			}
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace connect_done attempt=%d/%d network=%s addr=%s", attempt, attempts, network, addr)
+		},
+		TLSHandshakeStart: func() {
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace tls_start attempt=%d/%d", attempt, attempts)
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			if err != nil {
+				helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace tls_done attempt=%d/%d err=%v", attempt, attempts, err)
+				return
+			}
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace tls_done attempt=%d/%d negotiated_protocol=%q server_name=%q peer_certs=%d", attempt, attempts, state.NegotiatedProtocol, state.ServerName, len(state.PeerCertificates))
+		},
+		WroteHeaders: func() {
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace wrote_headers attempt=%d/%d", attempt, attempts)
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err != nil {
+				helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace wrote_request attempt=%d/%d err=%v", attempt, attempts, info.Err)
+				return
+			}
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace wrote_request attempt=%d/%d", attempt, attempts)
+		},
+		GotFirstResponseByte: func() {
+			helps.LogWithRequestID(ctx).Debugf("codex executor: httptrace first_response_byte attempt=%d/%d", attempt, attempts)
+		},
+	}
+}
+
+func truncateCodexDebugPayload(payload []byte, limit int) string {
+	payload = bytes.TrimSpace(payload)
+	if limit <= 0 || len(payload) <= limit {
+		return string(payload)
+	}
+	return string(payload[:limit]) + "...<truncated>"
 }
 
 func codexRetryAttemptCount(cfg *config.Config, auth *cliproxyauth.Auth) int {
@@ -1028,7 +1144,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgOriginator, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
@@ -1050,6 +1166,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		r.Header.Set("Originator", originator)
+	} else if cfgOriginator != "" {
+		r.Header.Set("Originator", cfgOriginator)
 	} else if !isAPIKey {
 		r.Header.Set("Originator", codexOriginator)
 	}

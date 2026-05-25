@@ -26,6 +26,14 @@ import (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	return NewProxyAwareHTTPClientWithTransportCustomizer(ctx, cfg, auth, timeout, nil)
+}
+
+// NewProxyAwareHTTPClientWithTransportCustomizer creates a proxy-aware HTTP
+// client and lets callers adjust concrete HTTP transports before metrics are
+// attached. The customizer is skipped for context-provided RoundTrippers that
+// are not *http.Transport values.
+func NewProxyAwareHTTPClientWithTransportCustomizer(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, customize func(*http.Transport)) *http.Client {
 	httpClient := &http.Client{}
 	if timeout > 0 {
 		httpClient.Timeout = timeout
@@ -46,7 +54,10 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if proxyURL != "" {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
-			httpClient.Transport = transport
+			if customize != nil {
+				customize(transport)
+			}
+			httpClient.Transport = wrapUpstreamMetrics(transport)
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
@@ -55,7 +66,14 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+		if transport, ok := rt.(*http.Transport); ok && transport != nil && customize != nil {
+			transport = transport.Clone()
+			customize(transport)
+			rt = transport
+		}
+		httpClient.Transport = wrapUpstreamMetrics(rt)
+	} else {
+		httpClient.Transport = wrapUpstreamMetrics(nil)
 	}
 
 	return httpClient

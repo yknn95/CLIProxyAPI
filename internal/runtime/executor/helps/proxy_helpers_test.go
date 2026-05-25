@@ -11,8 +11,6 @@ import (
 )
 
 func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
-	t.Parallel()
-
 	client := NewProxyAwareHTTPClient(
 		context.Background(),
 		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}},
@@ -20,11 +18,23 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 		0,
 	)
 
-	transport, ok := client.Transport.(*http.Transport)
+	wrapper, ok := client.Transport.(*upstreamMetricsRoundTripper)
 	if !ok {
-		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+		t.Fatalf("transport type = %T, want *upstreamMetricsRoundTripper", client.Transport)
+	}
+	transport, ok := wrapper.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("inner transport type = %T, want *http.Transport", wrapper.base)
 	}
 	if transport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestNewProxyAwareHTTPClientWrapsTransportWithUpstreamMetrics(t *testing.T) {
+	client := NewProxyAwareHTTPClient(context.Background(), &config.Config{}, nil, 0)
+
+	if _, ok := client.Transport.(*upstreamMetricsRoundTripper); !ok {
+		t.Fatalf("transport type = %T, want *upstreamMetricsRoundTripper", client.Transport)
 	}
 }
