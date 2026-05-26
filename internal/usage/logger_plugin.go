@@ -58,6 +58,9 @@ type usageLogEntry struct {
 	ReasoningTokens int64  `json:"ReasoningTokens"`
 	CachedTokens    int64  `json:"CachedTokens"`
 	Tokens          int64  `json:"Tokens"`
+	Failed          bool   `json:"Failed"`
+	FailReason      string `json:"FailReason"`
+	FailStatusCode  int    `json:"FailStatusCode"`
 	UserAgent       string `json:"UserAgent"`
 	Timestamp       int64  `json:"Timestamp"`
 }
@@ -579,6 +582,9 @@ func buildUsageLogPayload(ctx context.Context, record coreusage.Record) ([]byte,
 		ReasoningTokens: detail.ReasoningTokens,
 		CachedTokens:    detail.CachedTokens,
 		Tokens:          detail.TotalTokens,
+		Failed:          record.Failed,
+		FailReason:      strings.TrimSpace(record.Fail.Body),
+		FailStatusCode:  record.Fail.StatusCode,
 		UserAgent:       resolveUserAgent(ctx),
 		Timestamp:       timestamp.Unix(),
 	}

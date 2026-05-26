@@ -167,6 +167,36 @@ func TestBuildUsageLogPayloadIncludesRequestMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildUsageLogPayloadIncludesFailureMetadata(t *testing.T) {
+	payload, err := buildUsageLogPayload(context.Background(), coreusage.Record{
+		Failed: true,
+		Fail: coreusage.Failure{
+			StatusCode: http.StatusBadGateway,
+			Body:       "websocket read failed: unexpected EOF",
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildUsageLogPayload error: %v", err)
+	}
+
+	var got usageLogEntry
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+	if !got.Failed {
+		t.Fatal("Failed = false, want true")
+	}
+	if got.FailStatusCode != http.StatusBadGateway {
+		t.Fatalf("FailStatusCode = %d, want %d", got.FailStatusCode, http.StatusBadGateway)
+	}
+	if got.FailReason != "websocket read failed: unexpected EOF" {
+		t.Fatalf("FailReason = %q, want failure body", got.FailReason)
+	}
+	if failIndex, userAgentIndex := bytes.Index(payload, []byte(`"Failed"`)), bytes.Index(payload, []byte(`"UserAgent"`)); failIndex < 0 || userAgentIndex < 0 || failIndex > userAgentIndex {
+		t.Fatalf("payload = %s, want failure fields before UserAgent", string(payload))
+	}
+}
+
 func TestBuildUsageLogPayloadIncludesUsageMetadataFromModelSuffix(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
