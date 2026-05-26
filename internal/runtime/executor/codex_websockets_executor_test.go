@@ -133,6 +133,8 @@ func TestCodexAutoExecutorUsesPooledWebsocketForStatelessHTTP(t *testing.T) {
 		},
 	}
 	exec := NewCodexAutoExecutor(cfg)
+	poolStore := &codexWebsocketPoolStore{pools: make(map[string]*codexWebsocketPool)}
+	exec.wsExec.pools = poolStore
 	auth := &cliproxyauth.Auth{
 		ID: "auth-1",
 		Attributes: map[string]string{
@@ -190,6 +192,8 @@ func TestCodexAutoExecutorSkipsPooledWebsocketForOpenAIImageRequests(t *testing.
 		},
 	}
 	exec := NewCodexAutoExecutor(cfg)
+	poolStore := &codexWebsocketPoolStore{pools: make(map[string]*codexWebsocketPool)}
+	exec.wsExec.pools = poolStore
 	auth := &cliproxyauth.Auth{
 		ID: "auth-1",
 		Attributes: map[string]string{
@@ -222,6 +226,82 @@ func TestCodexAutoExecutorSkipsPooledWebsocketForOpenAIImageRequests(t *testing.
 	}
 	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
 		t.Fatalf("image b64 = %q, want AA==; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestCodexAutoExecutorSkipsPooledWebsocketWhenStreamRequestExceedsPoolLimit(t *testing.T) {
+	var upgrades atomic.Int32
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("request path = %s, want /responses", r.URL.Path)
+		}
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			upgrades.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"websocket should not be attempted for oversized pooled request"}}`))
+			return
+		}
+
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"OK\"}]},\"output_index\":0}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+		CodexWebsocketPool: config.CodexWebsocketPoolConfig{
+			Enabled:          true,
+			MaxActivePerAuth: 30,
+			MaxIdlePerAuth:   4,
+			IdleTimeout:      "5m",
+			MaxRequestBytes:  256,
+		},
+	}
+	exec := NewCodexAutoExecutor(cfg)
+	poolStore := &codexWebsocketPoolStore{pools: make(map[string]*codexWebsocketPool)}
+	exec.wsExec.pools = poolStore
+	auth := &cliproxyauth.Auth{
+		ID: "auth-1",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":"` + strings.Repeat("x", 1024) + `"}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       true,
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	streamResult, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	if got := upgrades.Load(); got != 0 {
+		t.Fatalf("websocket upgrades = %d, want 0", got)
+	}
+	if got := httpRequests.Load(); got != 1 {
+		t.Fatalf("HTTP requests = %d, want 1", got)
+	}
+	poolStore.mu.Lock()
+	poolCount := len(poolStore.pools)
+	poolStore.mu.Unlock()
+	if poolCount != 0 {
+		t.Fatalf("websocket pools = %d, want 0", poolCount)
 	}
 }
 

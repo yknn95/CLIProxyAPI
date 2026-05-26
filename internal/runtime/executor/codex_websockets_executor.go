@@ -268,11 +268,18 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	var lease *codexWebsocketLease
+	wsReqBody := buildCodexWebsocketRequestBody(body)
+	pooledRequest := executionSessionID == "" && !cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketPoolEnabled(e.cfg)
+	if pooledRequest && codexWebsocketRequestTooLarge(e.cfg, len(wsReqBody)) {
+		err = fmt.Errorf("%w: bytes=%d limit=%d", errCodexWebsocketRequestTooLarge, len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: pooled non-stream request too large for websocket transport bytes=%d limit=%d", len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		return resp, err
+	}
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		sess.reqMu.Lock()
 		defer sess.reqMu.Unlock()
-	} else if !cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketPoolEnabled(e.cfg) {
+	} else if pooledRequest {
 		lease, err = e.acquirePooledSession(auth, wsURL)
 		if err != nil {
 			return resp, err
@@ -290,12 +297,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
-	if lease != nil && codexWebsocketRequestTooLarge(e.cfg, len(wsReqBody)) {
-		err = fmt.Errorf("%w: bytes=%d limit=%d", errCodexWebsocketRequestTooLarge, len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
-		helps.LogWithRequestID(ctx).Warnf("codex websocket executor: pooled non-stream request too large, falling back to HTTP bytes=%d limit=%d", len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
-		return resp, err
-	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -518,12 +519,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	var lease *codexWebsocketLease
+	wsReqBody := buildCodexWebsocketRequestBody(body)
+	pooledRequest := executionSessionID == "" && !cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketPoolEnabled(e.cfg)
+	if pooledRequest && codexWebsocketRequestTooLarge(e.cfg, len(wsReqBody)) {
+		errTooLarge := fmt.Errorf("%w: bytes=%d limit=%d", errCodexWebsocketRequestTooLarge, len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: pooled stream request too large for websocket transport bytes=%d limit=%d", len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
+		return nil, errTooLarge
+	}
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
 			sess.reqMu.Lock()
 		}
-	} else if !cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketPoolEnabled(e.cfg) {
+	} else if pooledRequest {
 		lease, err = e.acquirePooledSession(auth, wsURL)
 		if err != nil {
 			return nil, err
@@ -533,13 +541,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
-	if lease != nil && codexWebsocketRequestTooLarge(e.cfg, len(wsReqBody)) {
-		lease.release(false, "pool_request_too_large")
-		errTooLarge := fmt.Errorf("%w: bytes=%d limit=%d", errCodexWebsocketRequestTooLarge, len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
-		helps.LogWithRequestID(ctx).Warnf("codex websocket executor: pooled stream request too large, falling back to HTTP bytes=%d limit=%d", len(wsReqBody), codexWebsocketPoolMaxRequestBytes(e.cfg))
-		return nil, errTooLarge
-	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -1911,7 +1912,16 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		if err == nil || downstreamWS || !codexWebsocketPoolFallbackHTTP(e.wsExec.cfg) {
 			return resp, err
 		}
-		helps.LogWithRequestID(ctx).Warnf("codex auto executor: websocket request failed, falling back to HTTP: %v", err)
+		if errors.Is(err, errCodexWebsocketRequestTooLarge) {
+			helps.LogWithRequestID(ctx).Infof("codex auto executor: websocket pooled request too large, using HTTP fallback: %v", err)
+		} else {
+			helps.LogWithRequestID(ctx).Warnf("codex auto executor: websocket request failed, falling back to HTTP: %v", err)
+		}
+		httpResp, httpErr := e.httpExec.Execute(ctx, auth, req, opts)
+		if httpErr != nil {
+			helps.LogWithRequestID(ctx).Warnf("codex auto executor: HTTP fallback after websocket request failed: websocket_error=%v http_error=%v path=%q source_format=%q", err, httpErr, helps.PayloadRequestPath(opts), opts.SourceFormat.String())
+		}
+		return httpResp, httpErr
 	} else {
 		helps.LogWithRequestID(ctx).Debugf("codex auto executor: using HTTP transport websocket_enabled=%t downstream_websocket=%t websocket_pool_enabled=%t", wsEnabled, downstreamWS, poolEnabled)
 	}
@@ -1933,11 +1943,42 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		if err == nil || downstreamWS || !codexWebsocketPoolFallbackHTTP(e.wsExec.cfg) {
 			return resp, err
 		}
-		helps.LogWithRequestID(ctx).Warnf("codex auto executor: websocket stream request failed, falling back to HTTP: %v", err)
+		if errors.Is(err, errCodexWebsocketRequestTooLarge) {
+			helps.LogWithRequestID(ctx).Infof("codex auto executor: websocket pooled stream request too large, using HTTP fallback: %v", err)
+		} else {
+			helps.LogWithRequestID(ctx).Warnf("codex auto executor: websocket stream request failed, falling back to HTTP: %v", err)
+		}
+		httpResp, httpErr := e.httpExec.ExecuteStream(ctx, auth, req, opts)
+		if httpErr != nil {
+			helps.LogWithRequestID(ctx).Warnf("codex auto executor: HTTP stream fallback after websocket request failed: websocket_error=%v http_error=%v path=%q source_format=%q", err, httpErr, helps.PayloadRequestPath(opts), opts.SourceFormat.String())
+			return httpResp, httpErr
+		}
+		return wrapCodexHTTPFallbackStream(ctx, httpResp, err), nil
 	} else {
 		helps.LogWithRequestID(ctx).Debugf("codex auto executor: using HTTP stream transport websocket_enabled=%t downstream_websocket=%t websocket_pool_enabled=%t", wsEnabled, downstreamWS, poolEnabled)
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+}
+
+func wrapCodexHTTPFallbackStream(ctx context.Context, result *cliproxyexecutor.StreamResult, websocketErr error) *cliproxyexecutor.StreamResult {
+	if result == nil || result.Chunks == nil {
+		return result
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				helps.LogWithRequestID(ctx).Warnf("codex auto executor: HTTP stream fallback chunk failed after websocket request failed: websocket_error=%v http_error=%v", websocketErr, chunk.Err)
+			}
+			select {
+			case out <- chunk:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
 }
 
 func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
