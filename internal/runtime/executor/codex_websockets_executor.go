@@ -1900,6 +1900,9 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
+	if isCodexOpenAIImageRequest(opts) {
+		return e.httpExec.Execute(ctx, auth, req, opts)
+	}
 	downstreamWS := cliproxyexecutor.DownstreamWebsocket(ctx)
 	poolEnabled := codexWebsocketPoolEnabled(e.wsExec.cfg)
 	wsEnabled := codexWebsocketTransportEnabled(auth, poolEnabled)
@@ -1918,6 +1921,9 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
+	}
+	if isCodexOpenAIImageRequest(opts) {
+		return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	downstreamWS := cliproxyexecutor.DownstreamWebsocket(ctx)
 	poolEnabled := codexWebsocketPoolEnabled(e.wsExec.cfg)

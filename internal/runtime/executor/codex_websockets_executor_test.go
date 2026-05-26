@@ -159,6 +159,72 @@ func TestCodexAutoExecutorUsesPooledWebsocketForStatelessHTTP(t *testing.T) {
 	}
 }
 
+func TestCodexAutoExecutorSkipsPooledWebsocketForOpenAIImageRequests(t *testing.T) {
+	var upgrades atomic.Int32
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("request path = %s, want /responses", r.URL.Path)
+		}
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			upgrades.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-image-2' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-img\",\"created_at\":123,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"AA==\",\"output_format\":\"png\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+		CodexWebsocketPool: config.CodexWebsocketPoolConfig{
+			Enabled:          true,
+			MaxActivePerAuth: 30,
+			MaxIdlePerAuth:   4,
+			IdleTimeout:      "5m",
+		},
+	}
+	exec := NewCodexAutoExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		ID: "auth-1",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-image-2",
+		Payload: []byte(`{"model":"gpt-image-2","prompt":"make it sharper","response_format":"b64_json","images":[{"image_url":"data:image/png;base64,AA=="}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-image"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/images/edits",
+		},
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := upgrades.Load(); got != 0 {
+		t.Fatalf("websocket upgrades = %d, want 0", got)
+	}
+	if got := httpRequests.Load(); got != 1 {
+		t.Fatalf("HTTP requests = %d, want 1", got)
+	}
+	if got := gjson.GetBytes(resp.Payload, "data.0.b64_json").String(); got != "AA==" {
+		t.Fatalf("image b64 = %q, want AA==; payload=%s", got, resp.Payload)
+	}
+}
+
 func TestCodexAutoExecutorPooledWebsocketPatchesEmptyResponsesOutput(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
