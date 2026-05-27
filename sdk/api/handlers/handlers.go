@@ -22,6 +22,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
@@ -50,12 +51,21 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
-	defaultStreamingBootstrapRetries = 0
+	defaultStreamingBootstrapRetries = 1
+	defaultBootstrapRetryMaxBody     = 16 << 20
 	usageRequestModelContextKey      = "usage_request_model"
 	usageRequestBodyContextKey       = "usage_request_body"
 	usageHasImageToolContextKey      = "usage_has_image_tool"
 	usageRequestFormatContextKey     = "usage_request_format"
 )
+
+var defaultStreamingBootstrapRetryStatuses = []int{
+	http.StatusRequestTimeout,
+	http.StatusInternalServerError,
+	http.StatusBadGateway,
+	http.StatusServiceUnavailable,
+	http.StatusGatewayTimeout,
+}
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
@@ -184,13 +194,34 @@ func NonStreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 // StreamingBootstrapRetries returns how many times a streaming request may be retried before any bytes are sent.
 func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
 	retries := defaultStreamingBootstrapRetries
-	if cfg != nil {
+	if cfg != nil && cfg.Streaming.BootstrapRetries != 0 {
 		retries = cfg.Streaming.BootstrapRetries
 	}
 	if retries < 0 {
 		retries = 0
 	}
 	return retries
+}
+
+func StreamingBootstrapRetryMaxBodyBytes(cfg *config.SDKConfig) int64 {
+	if cfg == nil || cfg.Streaming.BootstrapRetryMaxBodyBytes == 0 {
+		return defaultBootstrapRetryMaxBody
+	}
+	return cfg.Streaming.BootstrapRetryMaxBodyBytes
+}
+
+func StreamingBootstrapRetryStatuses(cfg *config.SDKConfig) []int {
+	if cfg == nil || len(cfg.Streaming.BootstrapRetryStatuses) == 0 {
+		return defaultStreamingBootstrapRetryStatuses
+	}
+	return cfg.Streaming.BootstrapRetryStatuses
+}
+
+func StreamingBootstrapRetryNetworkErrors(cfg *config.SDKConfig) bool {
+	if cfg == nil || cfg.Streaming.BootstrapRetryNetworkErrors == nil {
+		return true
+	}
+	return *cfg.Streaming.BootstrapRetryNetworkErrors
 }
 
 // PassthroughHeadersEnabled returns whether upstream response headers should be forwarded to clients.
@@ -733,9 +764,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
-	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	streamResult, err := h.executeStreamBootstrapRetry(ctx, providers, normalizedModel, req, opts, rawJSON)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -799,20 +829,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 			}
 		}
 
-		bootstrapEligible := func(err error) bool {
-			status := statusFromError(err)
-			if status == 0 {
-				return true
-			}
-			switch status {
-			case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired,
-				http.StatusRequestTimeout, http.StatusTooManyRequests:
-				return true
-			default:
-				return status >= http.StatusInternalServerError
-			}
-		}
-
 	outer:
 		for {
 			for {
@@ -835,8 +851,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload {
-						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
+						if bootstrapRetries < maxBootstrapRetries && h.bootstrapRetryEligible(rawJSON, streamErr) {
 							bootstrapRetries++
+							h.logBootstrapRetry(providers, req.Model, rawJSON, streamErr, bootstrapRetries, maxBootstrapRetries)
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
 								if passthroughHeadersEnabled {
@@ -880,6 +897,65 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+func (h *BaseAPIHandler) executeStreamBootstrapRetry(ctx context.Context, providers []string, normalizedModel string, req coreexecutor.Request, opts coreexecutor.Options, rawJSON []byte) (*coreexecutor.StreamResult, error) {
+	maxRetries := StreamingBootstrapRetries(h.Cfg)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+		if err == nil {
+			return streamResult, nil
+		}
+		lastErr = enrichAuthSelectionError(err, providers, normalizedModel)
+		if attempt >= maxRetries || !h.bootstrapRetryEligible(rawJSON, lastErr) {
+			return nil, lastErr
+		}
+		h.logBootstrapRetry(providers, req.Model, rawJSON, lastErr, attempt+1, maxRetries)
+	}
+}
+
+func (h *BaseAPIHandler) bootstrapRetryEligible(rawJSON []byte, err error) bool {
+	if err == nil {
+		return false
+	}
+	maxBodyBytes := StreamingBootstrapRetryMaxBodyBytes(h.Cfg)
+	if maxBodyBytes >= 0 && int64(len(rawJSON)) > maxBodyBytes {
+		return false
+	}
+	status := statusFromError(err)
+	if status > 0 {
+		for _, retryStatus := range StreamingBootstrapRetryStatuses(h.Cfg) {
+			if status == retryStatus {
+				return true
+			}
+		}
+		return false
+	}
+	return StreamingBootstrapRetryNetworkErrors(h.Cfg) && isTransientBootstrapNetworkError(err)
+}
+
+func isTransientBootstrapNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "websocket: close 1006") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "i/o timeout")
+}
+
+func (h *BaseAPIHandler) logBootstrapRetry(providers []string, model string, rawJSON []byte, err error, attempt int, maxRetries int) {
+	status := statusFromError(err)
+	log.WithFields(log.Fields{
+		"attempt":    attempt,
+		"max":        maxRetries,
+		"model":      model,
+		"providers":  strings.Join(providers, ","),
+		"status":     status,
+		"body_bytes": len(rawJSON),
+	}).Warnf("stream bootstrap retry before first payload: %v", err)
 }
 
 func validateSSEDataJSON(chunk []byte) error {

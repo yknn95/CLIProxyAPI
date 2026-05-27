@@ -681,6 +681,74 @@ func saveGeneratedImage(result imageCallResult, index int, metadata imageSaveMet
 	}
 }
 
+func imageResultFromOpenAIImageItem(item gjson.Result) (imageCallResult, bool) {
+	result := strings.TrimSpace(item.Get("b64_json").String())
+	outputFormat := strings.TrimSpace(item.Get("output_format").String())
+	if outputFormat == "" {
+		outputFormat = strings.TrimSpace(item.Get("mime_type").String())
+	}
+	if result == "" {
+		dataURL := strings.TrimSpace(item.Get("url").String())
+		mediaType, b64, ok := parseImageDataURL(dataURL)
+		if !ok {
+			return imageCallResult{}, false
+		}
+		result = b64
+		if outputFormat == "" {
+			outputFormat = mediaType
+		}
+	}
+	return imageCallResult{
+		Result:        result,
+		RevisedPrompt: strings.TrimSpace(item.Get("revised_prompt").String()),
+		OutputFormat:  outputFormat,
+		CallID:        strings.TrimSpace(item.Get("id").String()),
+	}, true
+}
+
+func parseImageDataURL(raw string) (mediaType string, b64 string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToLower(raw), "data:image/") {
+		return "", "", false
+	}
+	header, payload, found := strings.Cut(raw, ",")
+	if !found {
+		return "", "", false
+	}
+	parts := strings.Split(header, ";")
+	if len(parts) < 2 || !strings.EqualFold(parts[len(parts)-1], "base64") {
+		return "", "", false
+	}
+	mediaType = strings.TrimPrefix(strings.ToLower(parts[0]), "data:")
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return "", "", false
+	}
+	return mediaType, payload, true
+}
+
+func saveImagesFromOpenAIImagesPayload(payload []byte) {
+	if !json.Valid(payload) {
+		return
+	}
+	metadata := imageSaveMetadata{}
+	if created := gjson.GetBytes(payload, "created").Int(); created > 0 {
+		metadata.CreatedAt = created
+	}
+	if usage := gjson.GetBytes(payload, "usage"); usage.Exists() && usage.IsObject() {
+		metadata.UsageRaw = []byte(usage.Raw)
+	}
+	data := gjson.GetBytes(payload, "data")
+	if !data.IsArray() {
+		return
+	}
+	for idx, item := range data.Array() {
+		if result, ok := imageResultFromOpenAIImageItem(item); ok {
+			saveGeneratedImage(result, idx, metadata)
+		}
+	}
+}
+
 func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
 	if h != nil && h.BaseAPIHandler != nil && h.BaseAPIHandler.Cfg != nil && h.BaseAPIHandler.Cfg.DisableImageGeneration == internalconfig.DisableImageGenerationAll {
 		c.AbortWithStatus(http.StatusNotFound)
@@ -1198,7 +1266,26 @@ func buildImagesAPIResponseFromXAI(payload []byte, responseFormat string) ([]byt
 	out, _ = sjson.SetBytes(out, "created", createdAt)
 	responseFormat = normalizeImagesResponseFormat(responseFormat)
 
-	for _, img := range results {
+	for idx, img := range results {
+		if img.B64JSON != "" {
+			saveGeneratedImage(imageCallResult{
+				Result:        img.B64JSON,
+				RevisedPrompt: img.RevisedPrompt,
+				OutputFormat:  img.MimeType,
+			}, idx, imageSaveMetadata{
+				CreatedAt: createdAt,
+				UsageRaw:  usageRaw,
+			})
+		} else if _, b64, ok := parseImageDataURL(img.URL); ok {
+			saveGeneratedImage(imageCallResult{
+				Result:        b64,
+				RevisedPrompt: img.RevisedPrompt,
+				OutputFormat:  img.MimeType,
+			}, idx, imageSaveMetadata{
+				CreatedAt: createdAt,
+				UsageRaw:  usageRaw,
+			})
+		}
 		item := []byte(`{}`)
 		if responseFormat == "url" {
 			if img.URL != "" {
@@ -1269,6 +1356,7 @@ func (h *OpenAIAPIHandler) collectRoutedImages(c *gin.Context, imageReq []byte, 
 	}
 
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	saveImagesFromOpenAIImagesPayload(resp)
 	_, _ = c.Writer.Write(resp)
 	cliCancel(nil)
 }

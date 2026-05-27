@@ -179,6 +179,24 @@ func TestCodexRetryAttemptCountForProxy(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPClientWithProxyAllowsHTTP2(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.local:8080"}})
+	client := executor.newCodexHTTPClient(context.Background(), nil)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("expected proxied Codex HTTP client to allow HTTP/2")
+	}
+	if len(transport.TLSNextProto) != 0 {
+		t.Fatalf("TLSNextProto should not disable HTTP/2, got len=%d", len(transport.TLSNextProto))
+	}
+	if transport.TLSClientConfig != nil && len(transport.TLSClientConfig.NextProtos) == 1 && transport.TLSClientConfig.NextProtos[0] == "http/1.1" {
+		t.Fatal("TLS ALPN should not be restricted to HTTP/1.1")
+	}
+}
+
 func TestDoCodexRequestWithRetryRetriesTransientProxyFailure(t *testing.T) {
 	var attempts atomic.Int32
 	resp, err := doCodexRequestWithRetry(context.Background(), true, func() (*http.Request, error) {

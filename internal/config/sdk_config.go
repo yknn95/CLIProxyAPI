@@ -54,6 +54,18 @@ type StreamingConfig struct {
 
 	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
 	// to allow auth rotation / transient recovery.
-	// <= 0 disables bootstrap retries. Default is 0.
+	// < 0 disables bootstrap retries. Default is 1.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// BootstrapRetryMaxBodyBytes limits bootstrap retries for large request payloads.
+	// < 0 disables the size guard. Default is 16 MiB.
+	BootstrapRetryMaxBodyBytes int64 `yaml:"bootstrap-retry-max-body-bytes,omitempty" json:"bootstrap-retry-max-body-bytes,omitempty"`
+
+	// BootstrapRetryStatuses lists HTTP statuses eligible for bootstrap retry.
+	// Default is 408, 500, 502, 503, and 504.
+	BootstrapRetryStatuses []int `yaml:"bootstrap-retry-statuses,omitempty" json:"bootstrap-retry-statuses,omitempty"`
+
+	// BootstrapRetryNetworkErrors controls retry for transient network errors without an HTTP status.
+	// nil defaults to true.
+	BootstrapRetryNetworkErrors *bool `yaml:"bootstrap-retry-network-errors,omitempty" json:"bootstrap-retry-network-errors,omitempty"`
 }

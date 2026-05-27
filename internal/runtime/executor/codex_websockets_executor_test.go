@@ -743,6 +743,7 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}
@@ -894,6 +895,7 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
+			Originator:   "config-originator",
 			BetaFeatures: "config-beta",
 		},
 	}

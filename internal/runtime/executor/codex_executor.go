@@ -658,21 +658,7 @@ func (e *CodexExecutor) doCodexRequest(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) newCodexHTTPClient(ctx context.Context, auth *cliproxyauth.Auth) *http.Client {
-	if !codexProxyConfigured(e.cfg, auth) {
-		return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	}
-
-	return helps.NewProxyAwareHTTPClientWithTransportCustomizer(ctx, e.cfg, auth, 0, func(transport *http.Transport) {
-		transport.ForceAttemptHTTP2 = false
-		if transport.TLSClientConfig == nil {
-			transport.TLSClientConfig = &tls.Config{}
-		} else {
-			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-		}
-		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
-		helps.LogWithRequestID(ctx).Debug("codex executor: forced HTTP/1.1 for proxied HTTP request")
-	})
+	return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 }
 
 func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, reporter *helps.UsageReporter, httpResp *http.Response, requestModel string, from sdktranslator.Format, to sdktranslator.Format, originalPayload []byte, body []byte) (cliproxyexecutor.Response, error, bool) {

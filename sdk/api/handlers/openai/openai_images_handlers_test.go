@@ -21,9 +21,37 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+type imagesTestExecutor struct {
+	payload []byte
+}
+
+func (e *imagesTestExecutor) Identifier() string { return "codex" }
+
+func (e *imagesTestExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{Payload: e.payload}, nil
+}
+
+func (e *imagesTestExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *imagesTestExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *imagesTestExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *imagesTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
 
 func TestBuildImagesAPIResponseSavesGeneratedImageAndMetadata(t *testing.T) {
 	tempDir := t.TempDir()
@@ -106,6 +134,45 @@ func TestBuildImagesAPIResponseSavesGeneratedImageAndMetadata(t *testing.T) {
 	}
 	if usage["total_tokens"] != float64(42) {
 		t.Fatalf("unexpected usage total_tokens: %v", usage["total_tokens"])
+	}
+}
+
+func TestImagesGenerationsSavesRoutedB64Response(t *testing.T) {
+	tempDir := t.TempDir()
+	oldDir := imagesSaveDir
+	imagesSaveDir = tempDir
+	t.Cleanup(func() {
+		imagesSaveDir = oldDir
+	})
+
+	img := base64.StdEncoding.EncodeToString([]byte("routed-image"))
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&imagesTestExecutor{
+		payload: []byte(`{"created":123,"data":[{"b64_json":"` + img + `","revised_prompt":"routed cat"}],"usage":{"total_tokens":7}}`),
+	})
+	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), &coreauth.Auth{ID: "codex-test", Provider: "codex"}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient("codex-test", "codex", []*registry.ModelInfo{{ID: defaultImagesToolModel, Type: registry.OpenAIImageModelType}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient("codex-test")
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	body := strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a cat","response_format":"b64_json"}`)
+
+	resp := performImagesEndpointRequest(t, imagesGenerationsPath, "application/json", body, handler.ImagesGenerations)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("read temp dir failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 saved files, got %d", len(entries))
 	}
 }
 
@@ -329,6 +396,13 @@ func TestBuildOpenAICompatImagesMultipartRequestPreservesStreamAndFileContentTyp
 }
 
 func TestBuildImagesAPIResponseFromXAI(t *testing.T) {
+	tempDir := t.TempDir()
+	oldDir := imagesSaveDir
+	imagesSaveDir = tempDir
+	t.Cleanup(func() {
+		imagesSaveDir = oldDir
+	})
+
 	payload := []byte(`{"created":123,"data":[{"b64_json":"AA==","revised_prompt":"refined","mime_type":"image/png"}],"usage":{"total_tokens":0}}`)
 
 	out, err := buildImagesAPIResponseFromXAI(payload, "b64_json")
