@@ -111,6 +111,9 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
+	// Codex configures provider-wide Codex request behavior.
+	Codex CodexConfig `yaml:"codex" json:"codex"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -186,6 +189,11 @@ type CodexWebsocketPoolConfig struct {
 	IdleTimeout      string `yaml:"idle-timeout" json:"idle-timeout"`
 	MaxRequestBytes  int    `yaml:"max-request-bytes" json:"max-request-bytes"`
 	FallbackHTTP     *bool  `yaml:"fallback-http,omitempty" json:"fallback-http,omitempty"`
+}
+
+// CodexConfig configures provider-wide Codex request behavior.
+type CodexConfig struct {
+	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
 // TLSConfig holds HTTPS server settings.

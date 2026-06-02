@@ -237,6 +237,7 @@ func TestFinishCodexNonStreamResponseRetriesUntilCompleted(t *testing.T) {
 		sdktranslator.FromString("codex"),
 		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 		[]byte(`{"model":"gpt-5.5","stream":true}`),
+		codexIdentityConfuseState{},
 	)
 	if err == nil || !retryable {
 		t.Fatalf("expected retryable completion error, got err=%v retryable=%v", err, retryable)
@@ -254,6 +255,7 @@ func TestFinishCodexNonStreamResponseRetriesUntilCompleted(t *testing.T) {
 		sdktranslator.FromString("codex"),
 		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 		[]byte(`{"model":"gpt-5.5","stream":true}`),
+		codexIdentityConfuseState{},
 	)
 	if err != nil || retryable {
 		t.Fatalf("expected success, got err=%v retryable=%v", err, retryable)
