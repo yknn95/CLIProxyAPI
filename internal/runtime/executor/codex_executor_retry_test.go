@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -179,21 +180,14 @@ func TestCodexRetryAttemptCountForProxy(t *testing.T) {
 	}
 }
 
-func TestCodexHTTPClientWithProxyAllowsHTTP2(t *testing.T) {
+func TestCodexHTTPClientWithProxyUsesUtlsFallbackTransport(t *testing.T) {
 	executor := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.local:8080"}})
 	client := executor.newCodexHTTPClient(context.Background(), nil)
-	transport, ok := client.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	if client.Transport == nil {
+		t.Fatal("expected transport")
 	}
-	if !transport.ForceAttemptHTTP2 {
-		t.Fatal("expected proxied Codex HTTP client to allow HTTP/2")
-	}
-	if len(transport.TLSNextProto) != 0 {
-		t.Fatalf("TLSNextProto should not disable HTTP/2, got len=%d", len(transport.TLSNextProto))
-	}
-	if transport.TLSClientConfig != nil && len(transport.TLSClientConfig.NextProtos) == 1 && transport.TLSClientConfig.NextProtos[0] == "http/1.1" {
-		t.Fatal("TLS ALPN should not be restricted to HTTP/1.1")
+	if got := reflect.TypeOf(client.Transport).String(); got != "*helps.fallbackRoundTripper" {
+		t.Fatalf("transport = %s, want *helps.fallbackRoundTripper", got)
 	}
 }
 
@@ -238,6 +232,7 @@ func TestFinishCodexNonStreamResponseRetriesUntilCompleted(t *testing.T) {
 		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 		[]byte(`{"model":"gpt-5.5","stream":true}`),
 		codexIdentityConfuseState{},
+		codexReasoningReplayScope{},
 	)
 	if err == nil || !retryable {
 		t.Fatalf("expected retryable completion error, got err=%v retryable=%v", err, retryable)
@@ -256,6 +251,7 @@ func TestFinishCodexNonStreamResponseRetriesUntilCompleted(t *testing.T) {
 		[]byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 		[]byte(`{"model":"gpt-5.5","stream":true}`),
 		codexIdentityConfuseState{},
+		codexReasoningReplayScope{},
 	)
 	if err != nil || retryable {
 		t.Fatalf("expected success, got err=%v retryable=%v", err, retryable)
