@@ -442,7 +442,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
-			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event error session=%q payload=%s", executionSessionID, truncateCodexDebugPayload(payload, 512))
+			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event error session=%q payload=%s", executionSessionID, codexDebugPayloadForLog(e.cfg, payload, 512))
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 			}
@@ -452,7 +452,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
-		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event type=%q bytes=%d payload=%s", eventType, len(payload), truncateCodexDebugPayload(payload, 512))
+		helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream non-stream event type=%q bytes=%d payload=%s", eventType, len(payload), codexDebugPayloadForLog(e.cfg, payload, 512))
 		if eventType == "response.output_item.done" {
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 			continue
@@ -765,7 +765,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
-				helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event error session=%q payload=%s", executionSessionID, truncateCodexDebugPayload(payload, 512))
+				helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event error session=%q payload=%s", executionSessionID, codexDebugPayloadForLog(e.cfg, payload, 512))
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
@@ -779,7 +779,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
-			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event type=%q bytes=%d payload=%s", eventType, len(payload), truncateCodexDebugPayload(payload, 512))
+			helps.LogWithRequestID(ctx).Debugf("codex websocket executor: upstream stream event type=%q bytes=%d payload=%s", eventType, len(payload), codexDebugPayloadForLog(e.cfg, payload, 512))
 			switch eventType {
 			case "response.output_item.done":
 				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)

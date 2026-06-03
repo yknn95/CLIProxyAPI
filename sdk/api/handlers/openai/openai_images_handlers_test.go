@@ -267,6 +267,36 @@ func TestBuildXAIImagesGenerationsRequest(t *testing.T) {
 	}
 }
 
+func TestBuildImagesResponsesRequestUsesConfiguredBaseModel(t *testing.T) {
+	tool := []byte(`{"type":"image_generation","action":"generate","model":"gpt-image-2"}`)
+
+	req := buildImagesResponsesRequest(&sdkconfig.SDKConfig{GPTImage2BaseModel: "gpt-5.5"}, "draw a cat", nil, tool)
+
+	if got := gjson.GetBytes(req, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("model = %q, want gpt-5.5", got)
+	}
+}
+
+func TestBuildImagesResponsesRequestKeepsImageModelPrefixForConfiguredBaseModel(t *testing.T) {
+	tool := []byte(`{"type":"image_generation","action":"generate","model":"codex/gpt-image-2"}`)
+
+	req := buildImagesResponsesRequest(&sdkconfig.SDKConfig{GPTImage2BaseModel: "gpt-5.5"}, "draw a cat", nil, tool)
+
+	if got := gjson.GetBytes(req, "model").String(); got != "codex/gpt-5.5" {
+		t.Fatalf("model = %q, want codex/gpt-5.5", got)
+	}
+}
+
+func TestBuildImagesResponsesRequestFallsBackForInvalidConfiguredBaseModel(t *testing.T) {
+	tool := []byte(`{"type":"image_generation","action":"generate","model":"codex/gpt-image-2"}`)
+
+	req := buildImagesResponsesRequest(&sdkconfig.SDKConfig{GPTImage2BaseModel: "claude-4"}, "draw a cat", nil, tool)
+
+	if got := gjson.GetBytes(req, "model").String(); got != "codex/"+defaultImagesMainModel {
+		t.Fatalf("model = %q, want codex/%s", got, defaultImagesMainModel)
+	}
+}
+
 func TestBuildXAIImagesEditRequest(t *testing.T) {
 	req := buildXAIImagesEditRequest("grok-imagine-image", "edit it", []string{"data:image/png;base64,AA==", "https://example.com/image.png"}, "b64_json", "3:2", "1k", 0)
 

@@ -1123,7 +1123,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				eventType := gjson.GetBytes(data, "type").String()
-				helps.LogWithRequestID(ctx).Debugf("codex executor: upstream stream SSE event type=%q bytes=%d payload=%s", eventType, len(data), truncateCodexDebugPayload(data, 512))
+				helps.LogWithRequestID(ctx).Debugf("codex executor: upstream stream SSE event type=%q bytes=%d payload=%s", eventType, len(data), codexDebugPayloadForLog(e.cfg, data, 512))
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 					clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
@@ -1250,14 +1250,14 @@ func (e *CodexExecutor) finishCodexNonStreamResponse(ctx context.Context, report
 		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 		if !bytes.HasPrefix(line, dataTag) {
 			if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
-				helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE non-data line bytes=%d payload=%s", len(trimmed), truncateCodexDebugPayload(trimmed, 512))
+				helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE non-data line bytes=%d payload=%s", len(trimmed), codexDebugPayloadForLog(e.cfg, trimmed, 512))
 			}
 			continue
 		}
 
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
-		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE event type=%q bytes=%d payload=%s", eventType, len(eventData), truncateCodexDebugPayload(eventData, 512))
+		helps.LogWithRequestID(ctx).Debugf("codex executor: upstream non-stream SSE event type=%q bytes=%d payload=%s", eventType, len(eventData), codexDebugPayloadForLog(e.cfg, eventData, 512))
 
 		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
 			clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
@@ -1401,6 +1401,14 @@ func truncateCodexDebugPayload(payload []byte, limit int) string {
 		return string(payload)
 	}
 	return string(payload[:limit]) + "...<truncated>"
+}
+
+func codexDebugPayloadForLog(cfg *config.Config, payload []byte, limit int) string {
+	payload = bytes.TrimSpace(payload)
+	if cfg != nil && cfg.Debug && cfg.RequestLog {
+		return string(payload)
+	}
+	return truncateCodexDebugPayload(payload, limit)
 }
 
 func codexRetryAttemptCount(cfg *config.Config, auth *cliproxyauth.Auth) int {
