@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func validCodexReasoningReplayEncryptedContentForTest(seed byte) string {
@@ -49,6 +51,23 @@ func TestCodexReasoningReplayCacheScopesByModelAndSession(t *testing.T) {
 	}
 	if string(item) != `{"type":"reasoning","summary":[],"content":null,"encrypted_content":"`+encryptedContent+`"}` {
 		t.Fatalf("normalized item = %s", string(item))
+	}
+}
+
+func TestCodexReasoningReplayCachePreservesFunctionCallNamespace(t *testing.T) {
+	ClearCodexReasoningReplayCache()
+	t.Cleanup(ClearCodexReasoningReplayCache)
+
+	if !CacheCodexReasoningReplayItem("gpt-5.4", "session", []byte(`{"type":"function_call","call_id":"call_spawn","name":"spawn_agent","namespace":"multi_agent","arguments":"{}","status":"completed"}`)) {
+		t.Fatal("valid function_call was not cached")
+	}
+
+	item, ok := GetCodexReasoningReplayItem("gpt-5.4", "session")
+	if !ok {
+		t.Fatal("cache miss for function_call")
+	}
+	if got := gjson.GetBytes(item, "namespace").String(); got != "multi_agent" {
+		t.Fatalf("namespace = %q, want multi_agent; item=%s", got, string(item))
 	}
 }
 

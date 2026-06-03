@@ -186,6 +186,9 @@ func normalizeCodexReasoningReplayFunctionCallItem(itemResult gjson.Result) ([]b
 	normalized, _ = sjson.SetBytes(normalized, "call_id", callID)
 	normalized, _ = sjson.SetBytes(normalized, "name", name)
 	normalized, _ = sjson.SetBytes(normalized, "arguments", arguments.String())
+	if namespace := strings.TrimSpace(itemResult.Get("namespace").String()); namespace != "" {
+		normalized, _ = sjson.SetBytes(normalized, "namespace", namespace)
+	}
 	return normalized, true
 }
 
